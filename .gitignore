@@ -22,3 +22,10 @@ xcuserdata/
 # Claude Code settings personal to this machine
 .claude/settings.local.json
 BUILD_PLAN.md
+
+# Automation toolkit: local builds, environment and example output
+automation/.venv/
+automation/.build/
+automation/bin/
+automation/examples/out/
+__pycache__/
