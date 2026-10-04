@@ -3,7 +3,9 @@
     python -m compkit info TEMPLATE.comp
     python -m compkit analyze PHOTO [--box 1080x1350] [--preview crop.jpg]
     python -m compkit crop PHOTO... --box 1080x1350 [--box 1080x1920] --out crops/
-    python -m compkit grade PHOTO... --preset base.xmp --out graded/ [--max-side 2048] [--render]
+    python -m compkit cull SHOOT/ --out cull/ [--keep 200] [--per-moment 1] [--ratings]
+    python -m compkit learn-look EXPORTS/ RAWS/ -o look.cube
+    python -m compkit grade PHOTO... | --list cull/picks.txt --preset base.xmp [--match look.cube] --out graded/ [--render] [--jobs 6]
     python -m compkit grade project.comp --layer Photo --preset base.xmp [--out new.comp]
     python -m compkit sheet renders/*.jpg -o renders/_contact-sheet.jpg
     python -m compkit measure graded/*.jpg [--subject] [--json]
@@ -24,6 +26,7 @@ other columns name what to change:
 import argparse
 import csv
 import json
+import os
 
 from PIL import Image
 import sys
@@ -31,7 +34,8 @@ from pathlib import Path
 
 from pathlib import Path as _Path
 
-from . import AUTOMATION, CompError, Project, analyze, auto_focus, cover_crop, fit_image, load_image, measure
+from . import (AUTOMATION, CompError, Project, analyze, auto_focus, cover_crop, cull, fit_image, learn_look, load_image,
+               measure, write_ratings, write_results)
 
 
 def tree(project: Project) -> str:
@@ -214,8 +218,28 @@ def main(argv=None) -> int:
     sheet.add_argument("--columns", type=int, default=0, help="default: about square")
     sheet.add_argument("--size", type=int, default=360, help="longest side of each thumbnail")
 
+    culling = commands.add_parser("cull", help="find the frames worth grading in a shoot of hundreds or thousands")
+    culling.add_argument("inputs", nargs="+", help="shoot folders (searched recursively) or files")
+    culling.add_argument("--out", required=True, help="folder for cull.csv, picks.txt, cull.json and contact sheets")
+    culling.add_argument("--keep", type=int, help="at most this many picks, the best-scoring moments first")
+    culling.add_argument("--per-moment", type=int, default=1, help="picks per moment (default 1)")
+    culling.add_argument("--gap", type=float, default=2.0, help="seconds between frames of one moment (default 2)")
+    culling.add_argument("--distance", type=float, default=0.6, help="how alike frames of one moment look (default 0.6)")
+    culling.add_argument("--no-sheets", action="store_true", help="skip the contact sheets")
+    culling.add_argument("--ratings", action="store_true",
+                         help="also write Lightroom star ratings as .xmp sidecars beside the RAWs (never over existing ones)")
+
+    learn = commands.add_parser("learn-look", help="fit a .cube so graded RAWs match your Lightroom exports")
+    learn.add_argument("exports", help="folder of Lightroom JPEG exports that embed their develop settings")
+    learn.add_argument("raws", help="folder holding their RAW files")
+    learn.add_argument("-o", "--output", required=True, help="the .cube to write")
+    learn.add_argument("--frames", type=int, default=200, help="most exports to learn from (default 200)")
+
     grade = commands.add_parser("grade", help="apply a Lightroom preset as a base grade, kept tunable")
-    grade.add_argument("inputs", nargs="+", help="photos, or one .comp with --layer")
+    grade.add_argument("inputs", nargs="*", help="photos, or one .comp with --layer")
+    grade.add_argument("--list", help="a file of photo paths, one per line (e.g. a cull's picks.txt)")
+    grade.add_argument("--match", help="finish with this .cube look (see learn-look)")
+    grade.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) // 2), help="photos graded at once")
     grade.add_argument("--preset", required=True, help="Lightroom / Camera Raw preset (.xmp)")
     grade.add_argument("--amount", type=float, default=1.0, help="preset strength, 0–2 (default 1)")
     grade.add_argument("--layer", help="with a .comp: the picture layer (or graded folder) to grade")
@@ -270,36 +294,57 @@ def main(argv=None) -> int:
             print(json.dumps(result, indent=2))
             if args.preview:
                 preview(args.picture, found, crop, args.preview)
+        elif args.command == "cull":
+            frames = cull(args.inputs, gap=args.gap, distance=args.distance, per_moment=args.per_moment, keep=args.keep)
+            summary = write_results(frames, args.out, sheets=not args.no_sheets)
+            if args.ratings:
+                summary["ratings"] = write_ratings(frames)
+            print(json.dumps(summary, indent=2))
+        elif args.command == "learn-look":
+            print(json.dumps(learn_look(args.exports, args.raws, args.output, frames=args.frames), indent=2))
         elif args.command == "grade":
             settings = {}
             for pair in args.set:
                 field, _, value = pair.partition("=")
                 settings[field] = float(value)
-            if len(args.inputs) == 1 and args.inputs[0].endswith(".comp"):
+            inputs = list(args.inputs)
+            if args.list:
+                inputs += [line.strip() for line in open(_Path(args.list).expanduser()) if line.strip()]
+            if not inputs:
+                raise CompError("grade needs photos, a --list of them, or a .comp with --layer")
+            if len(inputs) == 1 and inputs[0].endswith(".comp"):
                 if not args.layer:
                     raise CompError("grading a .comp needs --layer, the picture layer to grade")
-                project = Project.open(args.inputs[0])
-                project.grade_layer(project.layer(args.layer), args.preset, amount=args.amount, settings=settings or None)
+                project = Project.open(inputs[0])
+                project.grade_layer(project.layer(args.layer), args.preset, amount=args.amount, settings=settings or None,
+                                    match=args.match)
                 print("saved", project.save(args.out or None))
                 return 0
             out = _Path(args.out or ".").expanduser()
             out.mkdir(parents=True, exist_ok=True)
+
+            def grade_one(picture):
+                found = analyze(picture)
+                w, h = found["width"], found["height"]
+                scale = min(1, args.max_side / max(w, h))
+                project = Project.new(max(1, round(w * scale)), max(1, round(h * scale)))
+                project.add_graded_photo(picture, args.preset, name="Photo", amount=args.amount,
+                                         settings=settings or None, max_scale=1, match=args.match)
+                saved = project.save(out / f"{_Path(picture).stem}.comp")
+                if args.render:
+                    project.render(saved.with_suffix(".jpg"), quality=0.92)
+                return saved
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             failures = 0
-            for picture in args.inputs:
-                try:
-                    found = analyze(picture)
-                    w, h = found["width"], found["height"]
-                    scale = min(1, args.max_side / max(w, h))
-                    project = Project.new(max(1, round(w * scale)), max(1, round(h * scale)))
-                    project.add_graded_photo(picture, args.preset, name="Photo", amount=args.amount,
-                                             settings=settings or None, max_scale=1)
-                    saved = project.save(out / f"{_Path(picture).stem}.comp")
-                    print(saved)
-                    if args.render:
-                        print(project.render(saved.with_suffix(".jpg"), quality=0.92))
-                except (CompError, OSError, ValueError, KeyError) as error:
-                    failures += 1
-                    print(f"compkit: {picture}: FAILED: {error}", file=sys.stderr)
+            with ThreadPoolExecutor(max(1, args.jobs)) as pool:
+                jobs = {pool.submit(grade_one, picture): picture for picture in inputs}
+                for done, job in enumerate(as_completed(jobs), start=1):
+                    try:
+                        print(f"[{done}/{len(inputs)}] {job.result()}")
+                    except (CompError, OSError, ValueError, KeyError) as error:
+                        failures += 1
+                        print(f"compkit: {jobs[job]}: FAILED: {error}", file=sys.stderr)
             return 1 if failures else 0
         elif args.command == "measure":
             rows = {picture: measure(picture, "subject" if args.subject else "frame") for picture in args.images}

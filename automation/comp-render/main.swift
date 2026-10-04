@@ -35,16 +35,30 @@ usage:
       how a Lightroom / Camera Raw preset maps onto Compositor's Camera Raw filter, as JSON: what was mapped
       where, approximations, what has no counterpart, the white balance conversion and its local corrections
   comp-render develop <picture> <preset.xmp> <graded.png> [options]
-      applies the preset with Compositor's Camera Raw engine. RAW files are decoded as shot first.
+      applies the preset with Compositor's Camera Raw engine. For RAW files, exposure, white balance (Kelvin, exactly),
+      highlights, whites and lens corrections are applied while decoding, in floating point, before the 8-bit grade
       --original <out.png>      also write the picture as decoded, cropped and sized but ungraded
       --crop <x,y,w,h>          crop first, in fractions of the upright picture (0–1)
       --size <WxH>              then resize to exactly this many pixels
       --amount <0-2>            preset strength (default 1)
       --as-shot <kelvin,tint>   the picture's own white balance, when it's known (RAW files report theirs)
       --set <field=value>       override a Camera Raw field after the preset (repeatable), e.g. exposure=0.3,
-                                clarity=10, curve.shadows=5, mixer.saturation.orange=-10 (see `preset` output)
+                                clarity=10, curve.shadows=5, mixer.saturation.orange=-10 (see `preset` output);
+                                for RAW files also raw.exposure, raw.temperature, raw.tint, raw.highlights, raw.whites
+      --match <look.cube>       finish with a color lookup table, e.g. one `compkit learn-look` fitted to your own
+                                Lightroom exports so the grade matches Lightroom's rendering
       --seed <n>                grain pattern (default 0)
       prints JSON: the as-shot white balance used, notes and what was skipped
+  comp-render probe <file>... | --list <paths.txt>
+      each frame's metadata as JSON, without decoding it: upright size, orientation, capture time, ISO, shutter,
+      aperture, focal length, camera and star rating (in-camera or from a Lightroom .xmp sidecar)
+  comp-render score <file>... | --list <paths.txt> [--size 1024] [--embeddings out.bin]
+      how good each frame looks, from its embedded preview (a RAW is never decoded), on every core: Vision's
+      aesthetic score, faces (capture quality, eye openness, sharpness), subject sharpness, exposure, and the
+      feature-print distance to the previous frame (pass frames in capture order to find bursts); --embeddings
+      also writes every frame's feature print ("<count> <length>\n" then float32 rows) for learning picks
+  comp-render previews <file>... | --list <paths.txt> --out <folder> [--size 400]
+      upright JPEG thumbnails from each file's embedded preview (RAWs aren't decoded), named <file>.jpg
   comp-render subject <picture>
       what Apple Vision finds in a picture, as JSON boxes in fractions of the picture from its top-left corner:
       faces, people (whole bodies), subject (the foreground Remove Background keeps, with its share of the
@@ -99,6 +113,8 @@ func loadPicture(_ path: String, maxSide: Int? = nil) -> CGImage {
     guard let picture = canvas.makeImage() else { fail("comp-render: \(url.path): could not read the picture") }
     return picture
 }
+
+let rawFields: Set<String> = ["raw.exposure", "raw.temperature", "raw.tint", "raw.highlights", "raw.whites"]
 
 func loadPreset(_ path: String) -> LightroomPreset {
     do { return try LightroomPreset(url: URL(fileURLWithPath: path)) }
@@ -271,7 +287,7 @@ case "preset":
 case "develop":
     var positional: [String] = []
     var originalPath: String?, crop: CGRect?, size: (Int, Int)?, amount = 1.0, givenAsShot: (Double, Double)?
-    var overrides: [(String, Double)] = [], seed: UInt32 = 0
+    var overrides: [(String, Double)] = [], seed: UInt32 = 0, tuning = RawDeveloper.Tuning(), match: ColorCube?
     while !arguments.isEmpty {
         let argument = arguments.removeFirst()
         func value() -> String {
@@ -299,10 +315,22 @@ case "develop":
             givenAsShot = (n[0], n[1])
         case "--set":
             let pair = value().split(separator: "=", maxSplits: 1).map(String.init)
-            guard pair.count == 2, CameraRawFields.paths[pair[0]] != nil, let number = Double(pair[1]) else {
+            guard pair.count == 2, CameraRawFields.paths[pair[0]] != nil || rawFields.contains(pair[0]), let number = Double(pair[1]) else {
                 fail("--set takes field=number with a field from `comp-render preset`'s \"fields\"")
             }
             overrides.append((pair[0], number))
+        // Calibration against Lightroom exports; the defaults are the chosen values.
+        case "--match":
+            let path = value()
+            do { match = try ColorCube(url: URL(fileURLWithPath: path)) }
+            catch { fail("comp-render: \(path): not a .cube color lookup table this can read") }
+        case "--raw-boost": tuning.boost = Double(value()) ?? tuning.boost
+        case "--raw-headroom": tuning.headroom = Double(value()) ?? tuning.headroom
+        case "--raw-sharpness": let text = value(); tuning.sharpness = text == "apple" ? nil : Double(text)
+        case "--raw-noise": let text = value(); tuning.noise = text == "apple" ? nil : Double(text)
+        case "--raw-tint-scale": tuning.tintScale = Double(value()) ?? tuning.tintScale
+        case "--raw-shoulder": tuning.shoulder = Double(value()) ?? tuning.shoulder
+        case "--raw-highlight-strength": tuning.highlightStrength = Double(value()) ?? tuning.highlightStrength
         case "--seed":
             guard let number = UInt32(value()) else { fail("--seed takes a whole number") }
             seed = number
@@ -312,16 +340,44 @@ case "develop":
     guard positional.count == 3 else { fail(usage) }
     let preset = loadPreset(positional[1])
     let pictureURL = URL(fileURLWithPath: positional[0])
-    var picture: CGImage
-    var asShot = givenAsShot
-    if RawImporter.matches(pictureURL), let neutral = RawImporter.asShot(pictureURL) {
-        // Decoded as shot: the preset's white balance is then reached from the camera's own reading.
-        do { picture = try RawImporter.develop(pictureURL, settings: neutral) }
-        catch { fail("comp-render: \(pictureURL.path): this RAW file couldn't be decoded") }
-        asShot = asShot ?? (Double(neutral.temperature), Double(neutral.tint))
-    } else {
-        picture = loadPicture(positional[0])
+    if RawImporter.matches(pictureURL), var developer = RawDeveloper(url: pictureURL) {
+        // A RAW file: exposure, Kelvin white balance, highlights and lens corrections are applied while decoding,
+        // in floating point; the rest of the grade runs on the 8-bit result.
+        developer.tuning = tuning
+        var mapping = PresetMapping(preset, amount: amount, asShot: developer.asShot, rawStage: true)
+        for (field, number) in overrides {
+            if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
+            switch field {
+            case "raw.exposure": mapping.raw?.exposure = number
+            case "raw.temperature": mapping.raw?.temperature = number
+            case "raw.tint": mapping.raw?.tint = number
+            case "raw.highlights": mapping.raw?.highlights = number
+            case "raw.whites": mapping.raw?.whites = number
+            default: break
+            }
+        }
+        let graded: CGImage
+        do {
+            if let originalPath { write(try developer.render(nil, crop: crop, size: size), as: .png, to: URL(fileURLWithPath: originalPath)) }
+            let base = try mapping.settings.apply(try developer.render(mapping.raw ?? RawStage(), crop: crop, size: size), scale: 1, seed: seed)
+            graded = try match?.apply(base) ?? base
+        } catch { fail("comp-render: \(pictureURL.path): \(error.localizedDescription)") }
+        write(graded, as: .png, to: URL(fileURLWithPath: positional[2]))
+        struct DevelopedRaw: Encodable {
+            let preset: String, width: Int, height: Int, orientation: Int, asShot: [Double], raw: RawStage?
+            let notes: [String], skipped: [String], localCorrections: Int
+        }
+        let orientation = CGImageSourceCreateWithURL(pictureURL as CFURL, nil)
+            .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }?[kCGImagePropertyOrientation] as? Int ?? 1
+        printJSON(DevelopedRaw(preset: preset.name, width: graded.width, height: graded.height, orientation: orientation,
+                               asShot: [developer.asShot.temperature, developer.asShot.tint], raw: mapping.raw,
+                               notes: mapping.notes, skipped: mapping.skipped,
+                               localCorrections: preset.corrections.filter(\.active).count))
+        exit(0)
     }
+    var picture: CGImage
+    let asShot = givenAsShot
+    picture = loadPicture(positional[0])
     if let crop {
         let rect = CGRect(x: (crop.minX * Double(picture.width)).rounded(), y: (crop.minY * Double(picture.height)).rounded(),
                           width: max(1, (crop.width * Double(picture.width)).rounded()),
@@ -345,7 +401,10 @@ case "develop":
         if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
     }
     let graded: CGImage
-    do { graded = try mapping.settings.apply(picture, scale: 1, seed: seed) }
+    do {
+        let base = try mapping.settings.apply(picture, scale: 1, seed: seed)
+        graded = try match?.apply(base) ?? base
+    }
     catch { fail("comp-render: the grade is out of range after overrides (\(error.localizedDescription))") }
     write(graded, as: .png, to: URL(fileURLWithPath: positional[2]))
     struct Developed: Encodable {
@@ -355,6 +414,90 @@ case "develop":
     printJSON(Developed(preset: preset.name, width: graded.width, height: graded.height, asShot: asShot.map { [$0.0, $0.1] },
                         whiteBalance: mapping.whiteBalance, notes: mapping.notes, skipped: mapping.skipped,
                         localCorrections: preset.corrections.filter(\.active).count))
+
+case "probe", "score", "previews":
+    var files: [String] = [], longSide = command == "previews" ? 400 : 1024, embeddings: String?, outFolder: String?
+    while !arguments.isEmpty {
+        let argument = arguments.removeFirst()
+        switch argument {
+        case "--list":
+            guard let path = arguments.first, let text = try? String(contentsOfFile: path, encoding: .utf8) else { fail("--list takes a file of paths, one per line") }
+            arguments.removeFirst()
+            files += text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
+        case "--out":
+            guard let path = arguments.first else { fail("--out takes a folder") }
+            arguments.removeFirst()
+            outFolder = path
+        case "--embeddings":
+            guard let path = arguments.first else { fail("--embeddings takes a file to write") }
+            arguments.removeFirst()
+            embeddings = path
+        case "--size":
+            guard let text = arguments.first, let number = Int(text), number >= 64 else { fail("--size takes pixels, 64 or more") }
+            arguments.removeFirst()
+            longSide = number
+        default: files.append(argument)
+        }
+    }
+    guard !files.isEmpty else { fail(usage) }
+    let urls = files.map { URL(fileURLWithPath: $0) }
+    final class Results<T>: @unchecked Sendable {
+        var items: [T?]
+        let lock = NSLock()
+        init(_ count: Int) { items = Array(repeating: nil, count: count) }
+        func set(_ index: Int, _ value: T) { lock.withLock { items[index] = value } }
+    }
+    if command == "previews" {
+        guard let outFolder else { fail("previews needs --out <folder>") }
+        let folder = URL(fileURLWithPath: outFolder)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        DispatchQueue.concurrentPerform(iterations: urls.count) { index in
+            guard let image = Culling.preview(urls[index], longSide: longSide) else { return }
+            let target = folder.appendingPathComponent(urls[index].deletingPathExtension().lastPathComponent + ".jpg")
+            write(image, as: .jpeg, to: target, properties: [kCGImageDestinationLossyCompressionQuality: 0.8])
+        }
+        print(folder.path)
+    } else if command == "probe" {
+        let results = Results<FrameInfo>(urls.count)
+        DispatchQueue.concurrentPerform(iterations: urls.count) { results.set($0, FrameInfo(url: urls[$0])) }
+        printJSON(results.items.compactMap { $0 })
+    } else {
+        let results = Results<(FrameScore, VNFeaturePrintObservation?)>(urls.count)
+        let done = Results<Bool>(1)
+        var finished = 0
+        DispatchQueue.concurrentPerform(iterations: urls.count) { index in
+            results.set(index, Culling.score(urls[index], longSide: longSide))
+            done.lock.withLock {
+                finished += 1
+                if finished % 50 == 0 || finished == urls.count {
+                    FileHandle.standardError.write(Data("scored \(finished)/\(urls.count)\n".utf8))
+                }
+            }
+        }
+        var scores = results.items.map { $0!.0 }
+        for index in scores.indices.dropFirst() {
+            guard let current = results.items[index]?.1, let previous = results.items[index - 1]?.1 else { continue }
+            var distance: Float = 0
+            if (try? current.computeDistance(&distance, to: previous)) != nil { scores[index].distanceToPrevious = Double(distance) }
+        }
+        // Each frame's Vision feature print as float32 rows, in the order given: what the picture shows, for learning
+        // which frames a photographer keeps.
+        if let embeddings {
+            let prints = results.items.map { $0?.1 }
+            let length = prints.compactMap { $0?.elementCount }.max() ?? 0
+            var floats: [Float] = []
+            for print in prints {
+                var row = [Float](repeating: 0, count: length)
+                if let print, print.elementType == .float, print.elementCount == length {
+                    print.data.withUnsafeBytes { row = Array($0.bindMemory(to: Float.self)) }
+                }
+                floats += row
+            }
+            let header = Data("\(prints.count) \(length)\n".utf8)
+            try? (header + floats.withUnsafeBufferPointer { Data(buffer: $0) }).write(to: URL(fileURLWithPath: embeddings))
+        }
+        printJSON(scores)
+    }
 
 case "subject":
     guard arguments.count == 1 else { fail(usage) }

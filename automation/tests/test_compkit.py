@@ -7,6 +7,7 @@ it with the app's own ProjectStore, and render with its ImageExporter.
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -44,6 +45,26 @@ PRESET = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
 
 def box(x, y, width, height, **extra):
     return {"x": x, "y": y, "width": width, "height": height, **extra}
+
+
+def shot(path, seed, when, blur=0, shift=0):
+    """A synthetic photo with a capture time: shapes on a fine texture, so it has detail to be sharp or soft."""
+    from PIL import ImageDraw, ImageFilter
+    rng = np.random.default_rng(seed)
+    base = (rng.random((600, 800, 3)) * 60 + 90).astype(np.uint8)
+    image = Image.fromarray(base)
+    draw = ImageDraw.Draw(image)
+    for _ in range(6):
+        x, y = rng.integers(0, 700), rng.integers(0, 500)
+        draw.ellipse((x + shift, y, x + shift + 120, y + 90), fill=tuple(int(v) for v in rng.integers(0, 255, 3)))
+    if blur:
+        image = image.filter(ImageFilter.GaussianBlur(blur))
+    exif = image.getexif()
+    ifd = exif.get_ifd(0x8769)
+    ifd[0x9003] = when.strftime("%Y:%m:%d %H:%M:%S")
+    ifd[0x9291] = f"{when.microsecond // 1000:03d}"
+    image.save(path, quality=92, exif=exif)
+    return path
 
 
 class AutoFocusTests(unittest.TestCase):
@@ -461,6 +482,83 @@ class CompkitTests(unittest.TestCase):
         self.assertIn("box=(w, None)", errors.getvalue())
         layer.set_text(size=60, box=(400, None))
         self.assertFalse(layer.text_metrics()["overflow"])
+
+    def test_cull_groups_bursts_and_rejects_blur(self):
+        import datetime as dt
+        from compkit import cull, write_results
+        shoot = self.folder / "shoot"
+        shoot.mkdir()
+        start = dt.datetime(2026, 6, 27, 22, 0, 0)
+        for i in range(3):  # a burst: the same scene, a hair apart, half a second apart
+            shot(shoot / f"burst-{i}.jpg", seed=1, when=start + dt.timedelta(seconds=0.5 * i), shift=2 * i)
+        shot(shoot / "later-a.jpg", seed=2, when=start + dt.timedelta(seconds=60))
+        shot(shoot / "later-b.jpg", seed=3, when=start + dt.timedelta(seconds=120))
+        shot(shoot / "blurred.jpg", seed=4, when=start + dt.timedelta(seconds=180), blur=8)
+        frames = cull([shoot])
+        status = {f["name"]: f for f in frames}
+        self.assertEqual(len({f["moment"] for f in frames}), 4)
+        self.assertEqual(len({status[f"burst-{i}.jpg"]["moment"] for i in range(3)}), 1)
+        self.assertEqual(sum(status[f"burst-{i}.jpg"]["status"] == "pick" for i in range(3)), 1)
+        self.assertEqual(status["blurred.jpg"]["status"], "reject")
+        self.assertIn("soft", status["blurred.jpg"]["flags"])
+        summary = write_results(frames, self.folder / "cull", sheets=True)
+        self.assertEqual(summary["picks"], 3)
+        self.assertEqual(len((self.folder / "cull" / "picks.txt").read_text().split()), 3)
+        self.assertTrue(list((self.folder / "cull" / "sheets").glob("moments-*.jpg")))
+
+    def test_lightroom_crop_follows_the_raws_orientation(self):
+        from compkit import lightroom_crop
+        crop = {"HasCrop": "True", "CropLeft": "0.1", "CropTop": "0.2", "CropRight": "0.7", "CropBottom": "0.9", "CropAngle": "0"}
+        close = lambda a, b: all(abs(x - y) < 1e-9 for x, y in zip(a, b))
+        self.assertTrue(close(lightroom_crop(crop, 1), (0.1, 0.2, 0.6, 0.7)))
+        self.assertTrue(close(lightroom_crop(crop, 8), (0.2, 0.3, 0.7, 0.6)))
+        self.assertTrue(close(lightroom_crop(crop, 6), (0.1, 0.1, 0.7, 0.6)))
+        self.assertTrue(close(lightroom_crop(crop, 3), (0.3, 0.1, 0.6, 0.7)))
+        self.assertIsNone(lightroom_crop({**crop, "HasCrop": "False"}, 1))
+
+    def test_a_look_table_finishes_the_grade(self):
+        invert = self.folder / "invert.cube"
+        lines = ["LUT_3D_SIZE 2"] + [f"{1 - r} {1 - g} {1 - b}" for b in (0, 1) for g in (0, 1) for r in (0, 1)]
+        invert.write_text("\n".join(lines) + "\n")
+        plain, inverted = self.folder / "plain.png", self.folder / "inverted.png"
+        develop(self.gray(), self.preset(), plain)
+        develop(self.gray(), self.preset(), inverted, match=invert)
+        a = np.asarray(Image.open(plain).convert("RGB")).astype(int)
+        b = np.asarray(Image.open(inverted).convert("RGB")).astype(int)
+        self.assertLess(np.abs((255 - a) - b).mean(), 2)
+
+    def test_regrade_goes_back_to_the_source_file(self):
+        source = self.folder / "source.png"
+        Image.new("RGB", (300, 200), (90, 90, 90)).save(source)
+        p = Project.new(300, 200)
+        photo = p.add_graded_photo(source, self.preset())
+        saved = p.save(self.folder / "sourced.comp")
+        record = json.loads((self.folder / "sourced.sources.json").read_text())["photos"][photo.id]
+        self.assertEqual(Path(record["source"]), source.resolve())
+        q = Project.open(saved)
+        q.layer("Photo").regrade(amount=0.5)  # preset and source come from the record
+        self.assertIn("at 50%", q.layer("Photo").graded_parts()["graded"].name)
+        source.unlink()
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            q.layer("Photo").regrade(amount=0.7)
+        self.assertIn("missing", errors.getvalue())
+        q.save()
+
+    @unittest.skipUnless(os.environ.get("COMPKIT_TEST_RAW"), "set COMPKIT_TEST_RAW to a camera RAW file to test the RAW stage")
+    def test_raw_stage(self):
+        raw = Path(os.environ["COMPKIT_TEST_RAW"])
+        report = develop(raw, self.preset(), self.folder / "raw.png", original=self.folder / "raw-original.png",
+                         size=(400, 300), crop=(0.1, 0.1, 0.8, 0.6), settings={"raw.temperature": 4500})
+        self.assertEqual(report["raw"]["temperature"], 4500)
+        self.assertGreater(report["raw"]["exposure"], 0.9)  # the test preset's +1 EV, applied while decoding
+        self.assertTrue(report["raw"]["lensCorrection"])
+        self.assertEqual(Image.open(self.folder / "raw.png").size, (400, 300))
+        p = Project.new(400, 300)
+        photo = p.add_graded_photo(raw, self.preset())
+        p.save(self.folder / "raw.comp")
+        again = Project.open(self.folder / "raw.comp").layer("Photo").regrade(amount=0.5)
+        self.assertIn("raw", again)  # decoded from the RAW again, not the 8-bit original
 
     def test_box_text_shrinks_until_it_fits(self):
         p = Project.new(1000, 400)

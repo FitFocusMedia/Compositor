@@ -31,13 +31,40 @@ comp-render preset ~/Documents/Presets/"God Tones.xmp"
 
 That lists `mapped` settings (Lightroom name → Compositor field and value), the `whiteBalance` conversion,
 `notes` about approximations, what was `skipped` (no counterpart) and its `localCorrections`. Tell the person
-once, briefly, what doesn't carry over. Typical gaps are the camera profile (e.g. Adobe Color), lens-profile
-corrections, LUTs, brush/AI masks and Upright. Also say plainly that the arithmetic is Compositor's own: the
-result is close to Lightroom's in character, not pixel-identical.
+once, briefly, what doesn't carry over. Typical gaps are the camera profile (e.g. Adobe Color), LUTs, brush/AI
+masks and Upright.
 
-White balance: a preset's Kelvin/tint is absolute. RAW files are decoded as shot and moved from the camera's
-own reading to the preset's Kelvin, as Lightroom does. JPEG/HEIC photos get the shift the preset made on its own
-photo (its recorded as-shot values), which is the nearest equivalent.
+**RAW files** (the person shoots Sony a7R V .ARW) get the part of the preset that Lightroom applies to sensor data
+done while decoding, in floating point on all 14 bits, before anything becomes 8-bit:
+- exposure;
+- white balance at the preset's exact Kelvin/tint;
+- highlights and whites, rolled off from the RAW's headroom;
+- lens corrections, from the camera's own correction data.
+
+The rest of the preset (shadows, texture, clarity, curves, calibration, color, detail) runs on the result. JPEG
+and HEIC photos get the white balance as the shift the preset made on its own photo, the nearest equivalent.
+
+**Matching Lightroom's rendering.** Adobe's camera profiles and math aren't available, so on its own the grade is
+close to Lightroom's in character but visibly different: on the person's workshop shoot, about ΔE 5 at a coarse
+scale, darker midtones, less saturated skin and teal coming out blue. The fix is a look learned from their own
+Lightroom exports, which embed each frame's exact develop settings:
+
+```bash
+compkit learn-look "<shoot>/Photo Edits" "<shoot>/RAW" -o ~/Documents/Presets/"God Tones (a7R V).cube"
+```
+
+It develops each RAW with its export's settings, compares the two, and fits a 3D color table from the
+differences, scored on frames held out of the fitting.
+
+On the workshop (170 a7R V exports), frames held out of training went from coarse ΔE 5.1 with the old pipeline
+to 2.7, about the smallest difference most people notice, with no brightness or color bias left. The RAW stage
+itself doesn't change color match; it keeps highlights (stage lights hold their shape and color instead of
+clipping white) and precision. The look is what matches Adobe's rendering. The look is saved at
+`~/Documents/Presets/God Tones (a7R V).cube`.
+
+Pass it as `--match` (or `match=`) whenever grading that camera with that preset. A look is specific to its
+camera and preset, so learn another for a different body or preset. Exports without embedded settings (no
+"include develop settings" on export) can't be used.
 
 ## 2. Grade
 
@@ -48,7 +75,10 @@ compkit grade shoot/*.CR3 --preset ~/Documents/Presets/"God Tones.xmp" --out gra
 ```
 
 `--amount 0.7` applies the preset at 70% (0–2). `--set exposure=0.2 --set clarity=10` overrides Camera Raw
-fields after the preset; `comp-render preset` lists the field names under `fields`. Point curves aren't
+fields after the preset; `comp-render preset` lists the field names under `fields`. For RAW files the per-show
+settings the person syncs in Lightroom go to the RAW stage: `--set raw.temperature=4170 --set raw.tint=30
+--set raw.exposure=-0.14 --set raw.highlights=-11`. `--match look.cube` adds the learned look, `--list
+picks.txt` grades a list (a cull's picks, see compositor-cull) and `--jobs 6` grades several at once. Point curves aren't
 overridable this way: use the Tune · Curves layer. `--max-side` caps the project size (default 2048) and only
 ever shrinks, so small photos stay at their own size.
 
@@ -111,8 +141,11 @@ highlights and shadows, and the color cast of near-neutral areas with PIL/numpy 
 numbers against the guideline and across the set, then look at the result too (a contact sheet:
 `compkit sheet graded/*.jpg -o graded/_sheet.jpg`).
 
-To change the base grade itself rather than tune on top of it, re-grade from the kept original:
-`photo.regrade(preset, amount=0.8, settings={"shadows": -5})`. Tune layer settings survive, the preset's local
+To change the base grade itself rather than tune on top of it, re-grade:
+`photo.regrade(amount=0.8, settings={"raw.exposure": 0.1})`. Every project remembers its source file, crop,
+preset, strength, overrides and look in `<name>.sources.json` beside the `.comp`, so a re-grade decodes the RAW
+again with all its latitude. Arguments left out keep what the photo was graded with. If the RAW has moved, it
+falls back to the hidden 8-bit original and says so. Keep the sources file with the project when moving it. Tune layer settings survive, the preset's local
 corrections are rebuilt, and the strength and overrides are written into the Base Grade layer's name
 (`Photo · Base Grade (God Tones at 80%, shadows -5)`) so the person can see them in the app.
 

@@ -36,7 +36,8 @@ import numpy as np
 from PIL import Image, ImageCms, ImageOps
 
 __all__ = ["Project", "Layer", "CompError", "comp_render", "defaults", "subject_mask", "analyze", "auto_focus",
-           "fit_image", "read_preset", "develop", "measure", "BLEND_MODES"]
+           "fit_image", "read_preset", "develop", "measure", "lightroom_exports", "learn_look", "cull", "write_results",
+           "write_ratings", "BLEND_MODES"]
 
 AUTOMATION = Path(__file__).resolve().parent.parent
 COMP_RENDER = Path(os.environ.get("COMP_RENDER", AUTOMATION / "bin" / "comp-render"))
@@ -165,6 +166,10 @@ def _analysis_for(source) -> dict:
         print(f"compkit: no subject analysis for {source if not isinstance(source, Image.Image) else 'image'} "
               f"({error}); cropping around the center", file=sys.stderr)
         return {}
+
+
+def _sources_path(package: Path) -> Path:
+    return Path(package).with_suffix(".sources.json")
 
 
 def _as_shot_from(name: str):
@@ -327,11 +332,12 @@ def read_preset(preset) -> dict:
 
 
 def develop(source, preset, output, *, original=None, crop=None, size=None, amount: float = 1.0, as_shot=None,
-            settings: dict | None = None, seed: int = 0) -> dict:
+            settings: dict | None = None, seed: int = 0, match=None) -> dict:
     """Grades a picture with a preset through Compositor's Camera Raw engine (`comp-render develop`) and writes
     `output` (PNG). RAW files are decoded as shot first. `original` also writes the ungraded picture; `crop` is
     (x, y, w, h) in fractions of the upright picture; `size` (w, h) resizes before grading; `amount` 0–2 scales
-    the preset; `settings` overrides Camera Raw fields afterwards ({"exposure": 0.2, "curve.shadows": 5}).
+    the preset; `settings` overrides Camera Raw fields afterwards ({"exposure": 0.2, "curve.shadows": 5}, and for RAW
+    files "raw.exposure", "raw.temperature", …); `match` finishes with a .cube look, e.g. one learn_look fitted.
     Returns the report: preset name, as-shot white balance used, notes and what was skipped."""
     with tempfile.TemporaryDirectory() as folder:
         if isinstance(source, Image.Image):
@@ -353,6 +359,8 @@ def develop(source, preset, output, *, original=None, crop=None, size=None, amou
             args += ["--set", f"{field}={float(value):g}"]
         if seed:
             args += ["--seed", str(int(seed))]
+        if match:
+            args += ["--match", Path(match).expanduser()]
         return json.loads(comp_render(*args))
 
 
@@ -400,6 +408,162 @@ def measure(image, region: str = "frame") -> dict:
         "whites": neutral((L > 80) & (c < 25)),
         "cast": neutral((L > 25) & (L < 80) & (c < 12)),
     }
+
+
+# Learning a Lightroom look from past exports -----------------------------------------------------------------
+
+RAW_SUFFIXES = {".arw", ".cr2", ".cr3", ".nef", ".nrw", ".raf", ".rw2", ".orf", ".dng", ".pef", ".srw", ".3fr", ".iiq"}
+
+
+def lightroom_settings(jpeg) -> tuple[str, dict] | None:
+    """The develop settings Lightroom embedded in an export (XMP, when "include develop settings" was on): the XMP
+    text and its crs attributes, or None."""
+    with open(jpeg, "rb") as file:
+        data = file.read(2_000_000)
+    start = data.find(b"<x:xmpmeta")
+    if start < 0:
+        return None
+    end = data.find(b"</x:xmpmeta>", start)
+    xmp = data[start:end + 12].decode("utf8", "replace")
+    import re
+    attributes = dict(re.findall(r'crs:(\w+)="([^"]*)"', xmp))
+    return (xmp, attributes) if "RawFileName" in attributes else None
+
+
+def lightroom_crop(attributes: dict, orientation: int):
+    """Lightroom's crop (fractions in the RAW's stored orientation) on the upright picture, or None."""
+    if attributes.get("HasCrop") != "True" or abs(float(attributes.get("CropAngle", 0))) > 0.05:
+        return None
+    left, top, right, bottom = (float(attributes[k]) for k in ("CropLeft", "CropTop", "CropRight", "CropBottom"))
+    if orientation == 8:
+        left, top, right, bottom = top, 1 - right, bottom, 1 - left
+    elif orientation == 6:
+        left, top, right, bottom = 1 - bottom, left, 1 - top, right
+    elif orientation == 3:
+        left, top, right, bottom = 1 - right, 1 - bottom, 1 - left, 1 - top
+    elif orientation != 1:
+        return None
+    return (left, top, right - left, bottom - top)
+
+
+def lightroom_exports(exports, raws) -> list[dict]:
+    """Pairs of a Lightroom export and its RAW: every JPEG under `exports` whose embedded settings name a RAW found
+    under `raws`. Each pair: export, raw, xmp (the exact settings), attributes."""
+    found = {}
+    for root in ([raws] if isinstance(raws, (str, Path)) else raws):
+        for path in Path(root).expanduser().rglob("*"):
+            if path.suffix.lower() in RAW_SUFFIXES:
+                found[path.name] = path
+    pairs = []
+    for path in sorted(Path(exports).expanduser().rglob("*")):
+        if path.suffix.lower() not in (".jpg", ".jpeg"):
+            continue
+        settings = lightroom_settings(path)
+        if settings and settings[1]["RawFileName"] in found:
+            pairs.append({"export": path, "raw": found[settings[1]["RawFileName"]], "xmp": settings[0], "attributes": settings[1]})
+    return pairs
+
+
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    rgb = rgb.astype(np.float64) / 255
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    xyz = linear @ np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]).T
+    xyz /= np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+
+def _apply_cube(cube: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """Trilinear lookup of uint8 RGB through an (n, n, n, 3) table indexed [b, g, r]."""
+    n = cube.shape[0]
+    x = rgb.astype(np.float64) / 255 * (n - 1)
+    i0 = np.clip(np.floor(x).astype(int), 0, n - 2)
+    f = x - i0
+    out = np.zeros(rgb.shape, np.float64)
+    for dr in (0, 1):
+        for dg in (0, 1):
+            for db in (0, 1):
+                w = (f[..., 0] if dr else 1 - f[..., 0]) * (f[..., 1] if dg else 1 - f[..., 1]) * (f[..., 2] if db else 1 - f[..., 2])
+                out += w[..., None] * cube[i0[..., 2] + db, i0[..., 1] + dg, i0[..., 0] + dr]
+    return np.clip(out * 255 + 0.5, 0, 255).astype(np.uint8)
+
+
+def learn_look(exports, raws, output, *, frames: int = 80, holdout: float = 0.25, size: int = 25, preview: int = 360,
+               jobs: int | None = None) -> dict:
+    """Fits a color lookup table (.cube) that turns Compositor's develop of your RAWs into what Lightroom made of them,
+    from past Lightroom exports that embed their develop settings. Each RAW is developed with its export's exact
+    settings, compared with the export, and the differences averaged into a table over color space. A share of the
+    frames (`holdout`) is kept out of the fitting and used to report how much closer the table gets (ΔE). Use the
+    table with `develop(..., match=…)` / `--match` for the same camera and look."""
+    from concurrent.futures import ThreadPoolExecutor
+    pairs = lightroom_exports(exports, raws)
+    if len(pairs) < 4:
+        raise CompError(f"found {len(pairs)} Lightroom exports with embedded settings and their RAWs; need at least 4")
+    step = max(1, len(pairs) // frames)
+    pairs = pairs[::step][:frames]
+    folder = Path(tempfile.mkdtemp(prefix="learn-look-"))
+
+    def one(index_pair):
+        index, pair = index_pair
+        reference = Image.open(pair["export"]).convert("RGB")
+        reference.thumbnail((preview, preview), Image.LANCZOS)
+        xmp = folder / f"{index}.xmp"
+        xmp.write_text(pair["xmp"])
+        out = folder / f"{index}.png"
+        orientation = json.loads(comp_render("probe", pair["raw"]))[0]["orientation"]
+        crop = lightroom_crop(pair["attributes"], orientation)
+        args = ["develop", pair["raw"], xmp, out, "--size", f"{reference.width}x{reference.height}"]
+        if crop:
+            args += ["--crop", ",".join(f"{v:.6f}" for v in crop)]
+        comp_render(*args)
+        mine = Image.open(out).convert("RGB")
+        # Small and soft, so lens corrections and sharpening that differ by a pixel don't count as color.
+        shrink = lambda image: np.asarray(image.resize((max(1, image.width // 3), max(1, image.height // 3)), Image.BOX))
+        return shrink(mine), shrink(reference)
+
+    with ThreadPoolExecutor(jobs or max(2, (os.cpu_count() or 4) // 2)) as pool:
+        samples = list(pool.map(one, enumerate(pairs)))
+    shutil.rmtree(folder, ignore_errors=True)
+    test = set(range(0, len(samples), max(2, round(1 / holdout)))) if holdout else set()
+    train = [s for i, s in enumerate(samples) if i not in test]
+    source = np.concatenate([m.reshape(-1, 3) for m, _ in train]).astype(np.float64) / 255
+    target = np.concatenate([r.reshape(-1, 3) for _, r in train]).astype(np.float64) / 255
+    # Splat each sample's correction onto the 8 surrounding grid points, then fill and smooth where data is thin.
+    grid = np.zeros((size, size, size, 3)); weight = np.zeros((size, size, size))
+    x = source * (size - 1); i0 = np.clip(np.floor(x).astype(int), 0, size - 2); f = x - i0
+    residual = target - source
+    for dr in (0, 1):
+        for dg in (0, 1):
+            for db in (0, 1):
+                w = (f[:, 0] if dr else 1 - f[:, 0]) * (f[:, 1] if dg else 1 - f[:, 1]) * (f[:, 2] if db else 1 - f[:, 2])
+                idx = (i0[:, 2] + db, i0[:, 1] + dg, i0[:, 0] + dr)
+                np.add.at(weight, idx, w)
+                np.add.at(grid, idx, w[:, None] * residual)
+    known = weight > 0.5
+    correction = np.where(known[..., None], grid / np.maximum(weight, 1e-9)[..., None], 0.0)
+    confidence = np.clip(weight / 4, 0, 1)
+    for _ in range(40):  # spread corrections into colors the frames didn't show, fading toward no change
+        padded = np.pad(correction, ((1, 1), (1, 1), (1, 1), (0, 0)), mode="edge")
+        neighbors = sum(padded[1 + a:1 + a + size, 1 + b:1 + b + size, 1 + c:1 + c + size]
+                        for a, b, c in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))) / 6
+        correction = confidence[..., None] * correction + (1 - confidence[..., None]) * neighbors * 0.97
+    axis = np.linspace(0, 1, size)
+    identity = np.stack(np.meshgrid(axis, axis, axis, indexing="ij")[::-1], -1)  # [b, g, r] → (r, g, b)
+    cube = np.clip(identity + correction, 0, 1)
+    output = Path(output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w") as file:
+        file.write(f"TITLE \"Lightroom match ({len(train)} frames)\"\nLUT_3D_SIZE {size}\n")
+        for b in range(size):
+            for g in range(size):
+                for r in range(size):
+                    file.write("%.6f %.6f %.6f\n" % tuple(cube[b, g, r]))
+    report = {"output": str(output), "pairs": len(samples), "trained_on": len(train), "held_out": len(test)}
+    if test:
+        before = [np.sqrt(((_lab(m) - _lab(r)) ** 2).sum(-1)).mean() for i, (m, r) in enumerate(samples) if i in test]
+        after = [np.sqrt(((_lab(_apply_cube(cube, m)) - _lab(r)) ** 2).sum(-1)).mean() for i, (m, r) in enumerate(samples) if i in test]
+        report.update({"held_out_delta_e_before": round(float(np.mean(before)), 2), "held_out_delta_e_after": round(float(np.mean(after)), 2)})
+    return report
 
 
 def _local_weight(correction: dict, size: tuple[int, int]) -> np.ndarray | None:
@@ -594,7 +758,7 @@ class Layer:
         return self
 
     def replace_image(self, source, fit: str = "cover", focus="auto", max_scale: float | None = 2.0,
-                      preset=None, amount: float = 1.0, settings: dict | None = None) -> "Layer":
+                      preset=None, amount: float = 1.0, settings: dict | None = None, match=None) -> "Layer":
         """Puts a new picture in this layer's box (its current transform), as a template's placeholder: position,
         rotation, mask, effects, opacity and blend mode all stay. focus='auto' crops around faces and the subject
         (see auto_focus); (x, y) centers the crop on that point. On a graded-photo folder the new picture is graded
@@ -602,7 +766,8 @@ class Layer:
         if self.graded_parts():
             if preset is None:
                 raise CompError(f"{self.name!r} is a graded photo: give the preset to grade the new picture with")
-            self.project._grade_into(self, source, preset, focus=focus, max_scale=max_scale, amount=amount, settings=settings)
+            self.project._grade_into(self, source, preset, focus=focus, max_scale=max_scale, amount=amount,
+                                     settings=settings, match=match)
             return self
         t = self.transform
         image, (px, py, pw, ph) = fit_image(load_image(source), tuple(t["size"]), fit, focus, max_scale,
@@ -652,17 +817,36 @@ class Layer:
                 "local": [c for c in children if c.name.startswith(LOCAL)],
                 "tune": [c for c in children if c.name.startswith(TUNE)]}
 
-    def regrade(self, preset, amount: float = 1.0, settings: dict | None = None) -> dict:
-        """Grades a graded-photo folder again from its kept original: another preset, strength or Camera Raw
-        overrides (`settings`). Tune layers keep their settings; the preset's local corrections are rebuilt."""
+    def regrade(self, preset=None, amount: float | None = None, settings: dict | None = None, match=None) -> dict:
+        """Grades a graded-photo folder again: another preset, strength or Camera Raw overrides (`settings`), or a
+        look (`match`; False drops it). From the source file when the project knows it, so a RAW is decoded again
+        with all its latitude; otherwise from the kept 8-bit original. Unset arguments keep what the photo was
+        graded with. Tune layers keep their settings; the preset's local corrections are rebuilt."""
         parts = self.graded_parts()
         if not parts:
             raise CompError(f"{self.name!r} is not a graded photo (see Project.add_graded_photo)")
-        as_shot = _as_shot_from(parts["original"].name)
+        entry = self.project._sources.get(self.id) or {}
+        preset = preset or entry.get("preset")
+        if not preset:
+            raise CompError(f"{self.name!r}: give the preset to grade it with")
+        amount = entry.get("amount", 1.0) if amount is None else amount
+        settings = entry.get("settings") if settings is None else settings
+        match = entry.get("match") if match is None else (match or None)
+        source = entry.get("source")
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / "graded.png"
-            report = develop(parts["original"].pixels(), preset, out, amount=amount, as_shot=as_shot, settings=settings)
+            if source and Path(source).exists():
+                report = develop(source, preset, out, crop=entry.get("crop"), size=entry.get("size"), amount=amount,
+                                 settings=settings, match=match)
+            else:
+                if source:
+                    print(f"compkit: {self.name!r}: {source} is missing; grading from the kept 8-bit original", file=sys.stderr)
+                report = develop(parts["original"].pixels(), preset, out, amount=amount,
+                                 as_shot=_as_shot_from(parts["original"].name), settings=settings, match=match)
             parts["graded"].set_pixels(Image.open(out))
+        if entry:
+            entry.update({"preset": str(Path(preset).expanduser().resolve()), "amount": amount, "settings": settings or {},
+                          "match": str(Path(match).expanduser().resolve()) if match else None})
         self.project._finish_graded(self, parts["graded"], report, preset, amount, settings=settings)
         return report
 
@@ -884,6 +1068,14 @@ class Project:
         self.path = path
         self._images: dict[str, Image.Image] = {}
         self._masks: dict[str, Image.Image] = {}
+        # Graded photos' source files, crops and grades, so they can be graded again from the RAW. Kept beside the
+        # package (`<name>.sources.json`), since the app rewrites the package and keeps only what it knows.
+        self._sources: dict[str, dict] = {}
+        if path is not None and _sources_path(path).exists():
+            try:
+                self._sources = json.loads(_sources_path(path).read_text()).get("photos", {})
+            except (OSError, ValueError):
+                pass
 
     # Opening
 
@@ -1072,7 +1264,7 @@ class Project:
                          width: float | None = None, height: float | None = None, fit: str = "cover", focus="auto",
                          max_scale: float | None = 2.0, amount: float = 1.0, settings: dict | None = None,
                          local: bool = True, tune: bool = True, parent: Layer | None = None,
-                         above: Layer | None = None) -> Layer:
+                         above: Layer | None = None, match=None) -> Layer:
         """A photo with a Lightroom / Camera Raw preset (.xmp) applied as its base grade, kept adjustable. Makes a
         folder `name` holding, bottom to top:
           `<name> · Original`        the photo, ungraded and hidden (kept to grade again from)
@@ -1080,22 +1272,24 @@ class Project:
           `Preset · …`               the preset's radial/linear local corrections, as masked Exposure layers
           `Tune · Exposure/Curves/Hue/Saturation/Color Balance`  neutral adjustment layers to fine-tune with
         The folder keeps the grade and tuning to this photo. Placement and cropping work as in add_image
-        (cover or contain); `amount` 0–2 scales the preset; `settings` overrides Camera Raw fields."""
+        (cover or contain); `amount` 0–2 scales the preset; `settings` overrides Camera Raw fields; `match` finishes
+        with a .cube look (learn_look). A RAW source is graded at the RAW stage and remembered, so regrade() goes back
+        to it."""
         group = self.add_group(name, parent=parent, above=above)
         self._grade_into(group, source, preset, x=x, y=y, width=width, height=height, fit=fit, focus=focus,
-                         max_scale=max_scale, amount=amount, settings=settings, local=local, tune=tune)
+                         max_scale=max_scale, amount=amount, settings=settings, local=local, tune=tune, match=match)
         return group
 
     def grade_layer(self, layer: Layer, preset, source=None, *, focus="auto", amount: float = 1.0,
-                    settings: dict | None = None, max_scale: float | None = 2.0) -> Layer:
+                    settings: dict | None = None, max_scale: float | None = 2.0, match=None) -> Layer:
         """Turns a plain picture layer into a graded-photo folder of the same name, in the same place: graded from
         `source` (a new picture, cropped into the layer's box) or, without one, from the layer's own pixels. A
         layer mask moves onto the folder; layer effects are dropped (a folder can't carry them)."""
         if layer.graded_parts():
             if source is not None:
-                layer.replace_image(source, focus=focus, preset=preset, amount=amount, settings=settings)
+                layer.replace_image(source, focus=focus, preset=preset, amount=amount, settings=settings, match=match)
             else:
-                layer.regrade(preset, amount=amount, settings=settings)
+                layer.regrade(preset, amount=amount, settings=settings, match=match)
             return layer
         if layer.is_group or layer.adjustment or not layer.record.get("imageFile"):
             raise CompError(f"{layer.name!r} has no picture to grade")
@@ -1107,7 +1301,7 @@ class Project:
         picture = source if source is not None else layer.pixels()
         self._grade_into(group, picture, preset, x=t["origin"][0], y=t["origin"][1], width=t["size"][0],
                          height=t["size"][1], focus=focus if source is not None else (0.5, 0.5), max_scale=max_scale,
-                         amount=amount, settings=settings)
+                         amount=amount, settings=settings, match=match)
         if layer.record.get("maskFile"):
             mask = self._masks.get(layer.id) or Image.open(self.path / "images" / layer.record["maskFile"])
             group.set_mask(mask, enabled=layer.record.get("maskEnabled", True))
@@ -1117,7 +1311,7 @@ class Project:
         return group
 
     def _grade_into(self, group: Layer, source, preset, *, x=None, y=None, width=None, height=None, fit="cover",
-                    focus="auto", max_scale=2.0, amount=1.0, settings=None, local=True, tune=True) -> dict:
+                    focus="auto", max_scale=2.0, amount=1.0, settings=None, local=True, tune=True, match=None) -> dict:
         parts = group.graded_parts()
         found = _analysis_for(source)
         if found.get("width"):
@@ -1154,11 +1348,20 @@ class Project:
         with tempfile.TemporaryDirectory() as folder:
             original_png, graded_png = Path(folder) / "original.png", Path(folder) / "graded.png"
             report = develop(source, preset, graded_png, original=original_png, crop=crop, size=stored,
-                             amount=amount, settings=settings)
+                             amount=amount, settings=settings, match=match)
             original_pixels, graded_pixels = Image.open(original_png), Image.open(graded_png)
             original_pixels.load(); graded_pixels.load()
         as_shot = report.get("asShot")
-        original_name = f"{group.name}{ORIGINAL}" + (f" (as shot {as_shot[0]:.0f} K, {as_shot[1]:+.0f})" if as_shot else "")
+        details = ([Path(source).name] if not isinstance(source, Image.Image) else []) + \
+                  ([f"as shot {as_shot[0]:.0f} K, {as_shot[1]:+.0f}"] if as_shot else [])
+        original_name = f"{group.name}{ORIGINAL}" + (f" ({', '.join(details)})" if details else "")
+        if isinstance(source, Image.Image):
+            self._sources.pop(group.id, None)
+        else:
+            self._sources[group.id] = {"source": str(Path(source).expanduser().resolve()), "crop": list(crop) if crop else None,
+                                       "size": list(stored), "preset": str(Path(preset).expanduser().resolve()),
+                                       "amount": amount, "settings": settings or {},
+                                       "match": str(Path(match).expanduser().resolve()) if match else None}
         box = transform(*placement)
         if parts:
             parts["original"].name = original_name
@@ -1363,6 +1566,13 @@ class Project:
             self.path = target
         self._images.clear()
         self._masks.clear()
+        ids = {record["id"] for record in self.manifest["layers"]}
+        self._sources = {key: value for key, value in self._sources.items() if key in ids}
+        sidecar = _sources_path(target)
+        if self._sources:
+            sidecar.write_text(json.dumps({"format": "compkit.sources", "version": 1, "photos": self._sources}, indent=2))
+        elif sidecar.exists():
+            sidecar.unlink()
         if validate:
             comp_render("validate", target)
         return target
@@ -1398,3 +1608,6 @@ class Project:
     def open_in_app(self) -> None:
         """Opens the saved project in Compositor, where it then updates live as it's saved again."""
         subprocess.run(["open", "-a", "Compositor", str(self.path)], check=True)
+
+
+from .cull import cull, write_ratings, write_results  # noqa: E402  (culling builds on the functions above)

@@ -7,8 +7,8 @@ templates designed by hand in Compositor can be turned into finished images by s
 | --- | --- |
 | `bin/comp-render` | The app's own project loader, typesetter and renderer as a command-line tool. Output matches File › Export exactly. Built from `../Compositor` by `comp-render/build.sh`. |
 | `compkit/` | Python library for writing `.comp` packages: image, fill, gradient, text, adjustment and folder layers, masks, effects, clipping, guides; safe live writes; template fill. |
-| `compkit` (`python -m compkit`) | Command line: `info`, `fill`, `batch` (CSV → renders), `crop` (subject-aware crops to exact sizes), `analyze` (what the crop sees), `grade` (Lightroom preset as a tunable base grade), `sheet` (contact sheet), `where`. |
-| `skills/` | Claude Code skills: `compositor-design`, `compositor-batch`, `compositor-photo`, `compositor-grade`, `compositor-toolkit`. |
+| `compkit` (`python -m compkit`) | Command line: `cull` (thousands of frames → picks), `grade` (Lightroom preset as a tunable base grade), `learn-look` (match your Lightroom exports), `info`, `fill`, `batch` (CSV → renders), `crop` (subject-aware crops), `analyze`, `measure`, `sheet`, `where`. |
+| `skills/` | Claude Code skills: `compositor-design`, `-batch`, `-photo`, `-grade`, `-cull`, `-toolkit`. |
 | `install.sh` | Builds comp-render, sets up `.venv`, puts `comp-render`, `compkit` and `compkit-python` in `~/.local/bin`, and links the skills into `~/.claude/skills`. |
 | `examples/` | `build_post_template.py` builds a 1080×1350 post template; `batch/rows.csv` fills it. |
 | `tests/` | `.venv/bin/python -m unittest discover -s automation/tests` — every case is checked with the app's own loader and renderer. |
@@ -39,15 +39,43 @@ comp-render preset base.xmp         # how a Lightroom preset maps onto Composito
 comp-render develop shot.CR3 base.xmp graded.png --original orig.png [--amount 0.8] [--set exposure=0.2]
 ```
 
+## Shows: from thousands of RAWs to delivered images
+
+```sh
+compkit cull "/Volumes/Card/DCIM" --out show/cull [--keep 300] [--per-moment 2] [--ratings]
+compkit grade --list show/cull/picks.txt --preset base.xmp --match look.cube \
+  --set raw.temperature=4170 --set raw.exposure=-0.14 --out show/graded --render --jobs 6
+```
+
+`cull` reads each frame's embedded preview (RAWs aren't decoded), which takes about 15 s per 1,000 frames:
+- `comp-render probe` reads metadata and `comp-render score` measures, on every core: Apple's aesthetic score,
+  face capture quality and eye openness, sharpness of the subject in focus, a peak-sharpness check for
+  missed focus, exposure, and the Vision feature-print distance to the previous frame.
+- Frames group into moments: consecutive, within 2 s, alike.
+- Clear failures are rejected: nothing in focus, eyes shut, far off exposure.
+- The best frame of each moment is picked.
+- It writes `picks.txt`, `cull.csv`/`cull.json`, contact sheets, and optionally Lightroom star ratings as sidecars.
+
+Against a photographer's own 170 picks from a 429-frame shoot, it picked a frame in 124 of the 125 moments they
+used and wrongly rejected 1 keeper. Which frame of a burst to keep (expression, pose) stays their call.
+
 ## Lightroom presets
 
 `comp-render develop` reads a Lightroom / Camera Raw `.xmp` and applies every setting with a counterpart in the
 app's Camera Raw engine: light, presence, curves (parametric and point), color mixer, color grading, detail,
-effects, optics, geometry and calibration. White balance converts from Kelvin: RAW files go from their own
-as-shot reading to the preset's Kelvin, and other photos get the shift the preset made on its own photo.
-Profiles, LUTs, lens profiles and brush/AI masks have no counterpart and are reported. Radial and linear local
-corrections become masked Exposure layers. The arithmetic is Compositor's, so a grade is close to Lightroom's
-rather than identical.
+effects, optics, geometry and calibration.
+
+For RAW files, exposure, white balance (the exact Kelvin/tint), highlights, whites and lens corrections are
+applied while decoding, in floating point on the full sensor data, before the picture becomes 8-bit. Other photos
+get white balance as the shift the preset made on its own photo.
+
+Profiles, LUTs and brush/AI masks have no counterpart and are reported. Radial and linear local corrections
+become masked Exposure layers.
+
+Adobe's camera profiles and math aren't available, so `compkit learn-look EXPORTS RAWS -o look.cube` learns the
+remaining difference from your own Lightroom exports (which embed their develop settings) as a 3D color table;
+`--match look.cube` applies it. On a 429-frame a7R V shoot, frames held out of the learning came within coarse
+ΔE 2.7 of the Lightroom exports, against 5.1 for the previous 8-bit pipeline.
 
 ```sh
 compkit grade shoot/*.CR3 --preset ~/Documents/Presets/"God Tones.xmp" --out graded/ --render
@@ -57,7 +85,8 @@ compkit batch template.comp rows.csv --out renders/ --preset base.xmp
 
 Each graded photo is a folder holding the untouched original (hidden), the base grade, the preset's local
 corrections and neutral `Tune ·` layers (Exposure, Curves, Hue/Saturation, Color Balance), so every image can be
-tuned afterwards in Compositor or from code (`layer.regrade(preset, amount=…)` grades again from the original).
+tuned afterwards in Compositor or from code. `layer.regrade(amount=…, settings=…)` grades again from the source
+RAW, recorded with its crop and grade in `<name>.sources.json` beside the project.
 
 ## compkit
 

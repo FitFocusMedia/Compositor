@@ -12,9 +12,10 @@ missing, the repo is normally `~/Documents/Claude Projects/Compositor`.
 <repo>/
 ├── Compositor/                 the app's Swift sources (upstream: robbietilton/Compositor)
 └── automation/
-    ├── comp-render/            main.swift (the CLI), Develop.swift (Lightroom presets), SparkleStub.swift, build.sh
-    ├── compkit/                Python library (__init__.py) and CLI (__main__.py)
-    ├── skills/                 compositor-design, -batch, -photo, -grade, -toolkit (linked into ~/.claude/skills)
+    ├── comp-render/            main.swift (the CLI), Develop.swift (Lightroom presets, RAW stage, .cube looks),
+    │                           Cull.swift (probe/score/previews), SparkleStub.swift, build.sh
+    ├── compkit/                Python library (__init__.py), culling (cull.py) and CLI (__main__.py)
+    ├── skills/                 compositor-design, -batch, -photo, -grade, -cull, -toolkit (linked into ~/.claude/skills)
     ├── tests/test_compkit.py   every case checked with the app's own loader and renderer
     ├── install.sh              build + venv + launchers + skill links
     ├── bin/ .venv/ .build/     local, git-ignored
@@ -61,6 +62,8 @@ records it doesn't understand as they are.
 | `No module named compkit` | Run through `compkit` / `compkit-python`, or `automation/.venv/bin/python` from inside `automation/`. |
 | `comp-render … is missing` | Run `install.sh`. |
 | App tests: `SliderSnapTests` fails under Xcode 27 | Known: fixed upstream in PR robbietilton/Compositor#210 (the test must draw its window first). |
+| A RAW develops wrongly or not at all | `comp-render probe file.ARW` shows what macOS reads; the RAW stage needs a camera macOS supports (CIRAWFilter). RAW-stage tests run only with `COMPKIT_TEST_RAW=/path/to/file.ARW` set. |
+| Grades drift from Lightroom after a new camera or preset | Learn a new look: `compkit learn-look EXPORTS RAWS -o new.cube` (needs exports with embedded develop settings). |
 | A preset setting is ignored | `comp-render preset x.xmp` shows what's mapped and what's skipped. To map a new Lightroom key, add it to `PresetMapping` in `comp-render/Develop.swift` (field paths are in `CameraRawFields`), rebuild and add a case to the preset test. |
 
 App tests (only needed when touching app sources):

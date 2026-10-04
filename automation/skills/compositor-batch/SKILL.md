@@ -36,7 +36,8 @@ Commands come from the toolkit (if missing, use the compositor-toolkit skill): `
   - give photo placeholders the **box they should fill** (`add_image(..., x, y, width, height)`); new photos
     are cropped into that box;
   - for the person's base grade on every photo, make the placeholder a graded photo
-    (`add_graded_photo`, see the compositor-grade skill) or pass `--preset` to the batch.
+    (`add_graded_photo`, see the compositor-grade skill) or pass `--preset` (and `--match` for their learned
+    Lightroom look) to the batch.
 
 ## 2. Get the data into a CSV
 

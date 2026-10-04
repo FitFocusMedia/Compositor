@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreImage
 
 // Lightroom / Camera Raw presets (.xmp) read onto Compositor's Camera Raw filter, for `comp-render preset` and
 // `comp-render develop`. Each setting with a counterpart is mapped by name; white balance is converted from Kelvin;
@@ -183,14 +184,18 @@ struct PresetMapping {
     }
 
     var settings = CameraRawSettings()
+    /// For a RAW file: what the RAW decode applies, before the picture becomes 8-bit.
+    var raw: RawStage?
     var mapped: [Entry] = []
     var notes: [String] = []
     var skipped: [String] = []
     var whiteBalance: WhiteBalance?
 
     /// `amount` scales the whole preset (1 as saved, 0.5 half strength, up to 2). `asShot` is the photo's own white
-    /// balance when known (RAW files): the preset's Kelvin is then reached from it, as Lightroom does.
-    init(_ preset: LightroomPreset, amount: Double, asShot: (temperature: Double, tint: Double)?) {
+    /// balance when known: the preset's Kelvin is then reached from it, as Lightroom does. With `rawStage`, the
+    /// picture is a RAW file still to be decoded, and exposure, white balance (in Kelvin, exactly), highlights,
+    /// whites and lens corrections go to the RAW decode instead of the 8-bit engine.
+    init(_ preset: LightroomPreset, amount: Double, asShot: (temperature: Double, tint: Double)?, rawStage: Bool = false) {
         let v = preset.values
         func number(_ key: String) -> Double? { v[key].flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } }
         func set(_ key: String, _ field: String, _ convert: (Double) -> Double = { $0 }) {
@@ -204,14 +209,27 @@ struct PresetMapping {
         }
 
         // Light, presence and color.
-        for (key, field) in [("Exposure2012", "exposure"), ("Contrast2012", "contrast"), ("Highlights2012", "highlights"),
-                             ("Shadows2012", "shadows"), ("Whites2012", "whites"), ("Blacks2012", "blacks"),
-                             ("Texture", "texture"), ("Clarity2012", "clarity"), ("Dehaze", "dehaze"),
-                             ("Vibrance", "vibrance"), ("Saturation", "saturation")] {
+        var engineKeys = [("Exposure2012", "exposure"), ("Contrast2012", "contrast"), ("Highlights2012", "highlights"),
+                          ("Shadows2012", "shadows"), ("Whites2012", "whites"), ("Blacks2012", "blacks"),
+                          ("Texture", "texture"), ("Clarity2012", "clarity"), ("Dehaze", "dehaze"),
+                          ("Vibrance", "vibrance"), ("Saturation", "saturation")]
+        if rawStage {
+            var stage = RawStage()
+            stage.exposure = amount * (number("Exposure2012") ?? number("Exposure") ?? 0)
+            stage.highlights = amount * (number("Highlights2012") ?? 0)
+            stage.whites = amount * (number("Whites2012") ?? 0)
+            raw = stage
+            engineKeys.removeAll { ["Exposure2012", "Highlights2012", "Whites2012"].contains($0.0) }
+            for (key, field, value) in [("Exposure2012", "raw.exposure", stage.exposure), ("Highlights2012", "raw.highlights", stage.highlights),
+                                        ("Whites2012", "raw.whites", stage.whites)] where value != 0 {
+                mapped.append(Entry(from: key, to: field, value: value))
+            }
+        }
+        for (key, field) in engineKeys {
             set(key, field)
         }
         // Process 2010 and older presets.
-        if v["Exposure2012"] == nil { set("Exposure", "exposure") }
+        if v["Exposure2012"] == nil && !rawStage { set("Exposure", "exposure") }
         if v["Contrast2012"] == nil { set("Contrast", "contrast") }
         if v["Clarity2012"] == nil { set("Clarity", "clarity") }
 
@@ -224,6 +242,13 @@ struct PresetMapping {
             set("IncrementalTemperature", "temperature")
             set("IncrementalTint", "tint")
             notes.append("Relative white balance (for JPEGs) mapped directly; Compositor's warm/cool scale is its own.")
+        } else if mode != "As Shot", let kelvin = number("Temperature"), rawStage, let asShot {
+            let tint = number("Tint") ?? 0
+            let target = WhiteBalanceShift.blend(from: (asShot.temperature, asShot.tint), to: (kelvin, tint), amount: amount)
+            raw?.temperature = target.0
+            raw?.tint = target.1
+            mapped.append(Entry(from: "Temperature", to: "raw.temperature", value: target.0))
+            mapped.append(Entry(from: "Tint", to: "raw.tint", value: target.1))
         } else if mode != "As Shot", let kelvin = number("Temperature") {
             let tint = number("Tint") ?? 0
             let reference: (Double, Double, String)? = asShot.map { ($0.temperature, $0.tint, "this photo's as-shot") }
@@ -340,7 +365,13 @@ struct PresetMapping {
             notes.append("Defringe amounts mapped; their hue ranges keep Compositor's defaults.")
         }
         if v["LensProfileEnable"] == "1" {
-            skipped.append("Lens profile corrections: need the lens's own profile data, which Compositor doesn't have")
+            if rawStage {
+                raw?.lensCorrection = true
+                mapped.append(Entry(from: "LensProfileEnable", to: "raw.lensCorrection", value: 1))
+                notes.append("Lens corrections: from the camera's own correction data in the RAW, not Adobe's lens profile.")
+            } else {
+                skipped.append("Lens profile corrections: need the lens's own profile data, which Compositor doesn't have")
+            }
         }
         if let upright = number("PerspectiveUpright"), upright != 0 {
             skipped.append("Upright (automatic perspective): Compositor has guided upright only")
@@ -460,5 +491,169 @@ enum WhiteBalanceShift {
             : t <= 4000 ? -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867
             : 3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483
         return (x, y)
+    }
+}
+
+/// The part of a grade done while decoding a RAW file: what Lightroom applies to the sensor data itself. Apple's RAW
+/// pipeline works in floating point on all 14 bits, so exposure and white balance move real captured light, and
+/// highlights above the camera's white are still there to roll off rather than already clipped.
+struct RawStage: Encodable {
+    /// Kelvin and tint to neutralize, as Lightroom's Temperature/Tint; nil keeps the camera's as-shot reading.
+    var temperature: Double?
+    var tint: Double?
+    var exposure: Double = 0
+    /// Lightroom's −100…100: negative rolls the brightest tones down into range; positive opens them up.
+    var highlights: Double = 0
+    var whites: Double = 0
+    var lensCorrection = false
+}
+
+/// Decodes a RAW file: cropped and sized in the RAW pipeline, with a `RawStage` applied in floating point, and only
+/// then turned into the 8-bit sRGB picture Compositor's layers hold.
+struct RawDeveloper {
+    /// Tuning, settable from comp-render's calibration flags; defaults were chosen against Lightroom exports.
+    struct Tuning {
+        var boost = 1.0
+        var headroom = 0.0
+        var sharpness: Double? = 0
+        var noise: Double? = nil
+        var tintScale = 1.0
+        var shoulder = 0.3
+        /// How far Highlights −100 darkens the upper tones (a fraction of their level, most around light midtones).
+        var highlightStrength = 0.4
+    }
+
+    let filter: CIRAWFilter
+    let asShot: (temperature: Double, tint: Double)
+    /// The picture's upright size at full resolution.
+    let upright: CGSize
+    var tuning = Tuning()
+    private static let context = CIContext(options: [.useSoftwareRenderer: false,
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!])
+
+    init?(url: URL) {
+        guard let filter = CIRAWFilter(imageURL: url), let image = filter.outputImage else { return nil }
+        self.filter = filter
+        asShot = (Double(filter.neutralTemperature), Double(filter.neutralTint))
+        upright = image.extent.size
+    }
+
+    /// `stage` nil develops the picture as shot (the kept original). `crop` is in fractions of the upright picture
+    /// from its top-left; `size` the exact pixel size wanted.
+    func render(_ stage: RawStage?, crop: CGRect?, size: (Int, Int)?) throws -> CGImage {
+        let frame = crop ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        var scale = 1.0
+        if let size {
+            scale = min(1, max(Double(size.0) / (frame.width * upright.width), Double(size.1) / (frame.height * upright.height)) * 1.05)
+        }
+        filter.scaleFactor = Float(scale)
+        filter.isDraftModeEnabled = false
+        filter.boostAmount = Float(tuning.boost)
+        filter.extendedDynamicRangeAmount = Float(stage == nil ? 0 : tuning.headroom)
+        if filter.isHighlightRecoverySupported { filter.isHighlightRecoveryEnabled = true }
+        if let sharpness = tuning.sharpness, filter.isSharpnessSupported { filter.sharpnessAmount = Float(sharpness) }
+        if let noise = tuning.noise, filter.isLuminanceNoiseReductionSupported { filter.luminanceNoiseReductionAmount = Float(noise) }
+        if filter.isLensCorrectionSupported { filter.isLensCorrectionEnabled = stage?.lensCorrection ?? true }
+        filter.neutralTemperature = Float(stage?.temperature ?? asShot.temperature)
+        filter.neutralTint = Float(stage?.tint.map { $0 * tuning.tintScale } ?? asShot.tint)
+        filter.exposure = Float(stage?.exposure ?? 0)
+        guard let image = filter.outputImage else { throw ImageImportError.unreadable }
+        // Fractions from the top-left onto Core Image's bottom-left extent.
+        let extent = image.extent
+        var rect = CGRect(x: extent.minX + frame.minX * extent.width,
+                          y: extent.maxY - (frame.minY + frame.height) * extent.height,
+                          width: frame.width * extent.width, height: frame.height * extent.height).integral.intersection(extent)
+        var picture = image.cropped(to: rect).transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+        var width = Int(rect.width), height = Int(rect.height)
+        if let size, (size.0, size.1) != (width, height) {
+            let sx = Double(size.0) / rect.width, sy = Double(size.1) / rect.height
+            picture = picture.applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: sy, kCIInputAspectRatioKey: sx / sy])
+            width = size.0; height = size.1
+        }
+        rect = CGRect(x: 0, y: 0, width: width, height: height)
+        // Linear light, unclamped, so what lies above white is still there for the highlights to roll off.
+        var linear = [Float](repeating: 0, count: width * height * 4)
+        Self.context.render(picture, toBitmap: &linear, rowBytes: width * 16, bounds: rect, format: .RGBAf,
+                            colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!)
+        var bytes = [UInt8](repeating: 255, count: width * height * 4)
+        let highlights = Float(stage?.highlights ?? 0) / 100, whites = Float(stage?.whites ?? 0) / 100
+        // Above this, light the RAW still holds beyond white rolls off into range instead of clipping.
+        let knee = 1 - Float(tuning.shoulder) * max(0, -highlights) * 0.3 - (stage != nil && tuning.headroom > 0 ? 0.1 : 0)
+        let lift = 0.25 * max(0, highlights), white = 1 + 0.15 * whites
+        let pull = Float(tuning.highlightStrength) * max(0, -highlights)
+        func encode(_ v: Float) -> Float { v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055 }
+        func decode(_ v: Float) -> Float { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        let shapes = stage != nil
+        for index in stride(from: 0, to: linear.count, by: 4) {
+            var r = max(0, linear[index]), g = max(0, linear[index + 1]), b = max(0, linear[index + 2])
+            if shapes {
+                // On the brightest channel, so a colored light keeps its hue as it's brought into range.
+                let peak = max(r, g, b)
+                if peak > 0 {
+                    var v = encode(peak) * white
+                    // Lightroom's Highlights works on the upper half of the tones, most from light midtones up.
+                    if pull > 0 {
+                        let t = min(1, max(0, (v - 0.12) / 0.7))
+                        v *= 1 - pull * t * t * (3 - 2 * t)
+                    }
+                    if v > knee {
+                        let room = max(0.0001, 1 - knee)
+                        v = knee + room * (1 - exp(-(v - knee) / room))
+                    }
+                    if lift > 0 {
+                        let t = min(1, max(0, (v - 0.5) / 0.5))
+                        v += lift * t * t * (3 - 2 * t) * (1 - v)
+                    }
+                    let factor = decode(min(1, v)) / peak
+                    r *= factor; g *= factor; b *= factor
+                }
+            }
+            bytes[index] = UInt8(min(255, max(0, encode(r) * 255 + 0.5)))
+            bytes[index + 1] = UInt8(min(255, max(0, encode(g) * 255 + 0.5)))
+            bytes[index + 2] = UInt8(min(255, max(0, encode(b) * 255 + 0.5)))
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let result = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                                   provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { throw ExportError.render }
+        return result
+    }
+}
+
+/// A 3D color lookup table (.cube, as Resolve, Lightroom and Photoshop write them), applied to an 8-bit sRGB picture.
+struct ColorCube {
+    let size: Int
+    /// RGBA floats, red changing fastest, as Core Image's color cube takes them.
+    let data: Data
+
+    init(url: URL) throws {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        var size = 0
+        var values: [Float] = []
+        for line in text.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix("TITLE") || trimmed.hasPrefix("DOMAIN") { continue }
+            if trimmed.hasPrefix("LUT_3D_SIZE") {
+                size = Int(trimmed.split(separator: " ").last ?? "") ?? 0
+                continue
+            }
+            let parts = trimmed.split(separator: " ").compactMap { Float($0) }
+            if parts.count == 3 { values += [parts[0], parts[1], parts[2], 1] }
+        }
+        guard (2...128).contains(size), values.count == size * size * size * 4 else { throw CocoaError(.fileReadCorruptFile) }
+        self.size = size
+        data = values.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    func apply(_ image: CGImage) throws -> CGImage {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let output = CIImage(cgImage: image).applyingFilter("CIColorCubeWithColorSpace", parameters: [
+            "inputCubeDimension": size, "inputCubeData": data, "inputColorSpace": space, "inputExtrapolate": false])
+        let context = CIContext(options: [.workingColorSpace: space, .useSoftwareRenderer: false])
+        guard let result = context.createCGImage(output, from: CGRect(x: 0, y: 0, width: image.width, height: image.height),
+                                                 format: .RGBA8, colorSpace: space) else { throw ExportError.render }
+        return result
     }
 }
