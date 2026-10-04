@@ -17,7 +17,7 @@ find "$SRC" -name '*.swift' ! -name CompositorApp.swift | while read -r file; do
   name="${file#$SRC/}"; name="${name//\//_}"
   sed -e '/^import Sparkle$/d' "$file" > "$WORK/swift/$name"
 done
-cp "$HERE/main.swift" "$HERE/SparkleStub.swift" "$WORK/swift/"
+cp "$HERE"/*.swift "$WORK/swift/"
 
 echo "==> Compiling the C pixel kernels"
 for file in "$SRC"/Rendering/*.c; do

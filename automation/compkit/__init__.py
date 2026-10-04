@@ -26,6 +26,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -34,7 +35,8 @@ from typing import Iterable
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
 
-__all__ = ["Project", "Layer", "CompError", "comp_render", "defaults", "subject_mask", "BLEND_MODES"]
+__all__ = ["Project", "Layer", "CompError", "comp_render", "defaults", "subject_mask", "analyze", "auto_focus",
+           "fit_image", "read_preset", "develop", "measure", "BLEND_MODES"]
 
 AUTOMATION = Path(__file__).resolve().parent.parent
 COMP_RENDER = Path(os.environ.get("COMP_RENDER", AUTOMATION / "bin" / "comp-render"))
@@ -98,8 +100,8 @@ def rgb(color) -> tuple[float, float, float]:
 
 def transform(x: float, y: float, width: float, height: float, rotation: float = 0,
               flip_x: bool = False, flip_y: bool = False, sampling: str = "High quality") -> dict:
-    return {"origin": [x, y], "size": [width, height], "rotation": rotation,
-            "flipX": flip_x, "flipY": flip_y, "sampling": sampling}
+    return {"origin": [float(x), float(y)], "size": [float(width), float(height)], "rotation": float(rotation),
+            "flipX": bool(flip_x), "flipY": bool(flip_y), "sampling": sampling}
 
 
 def load_image(source) -> Image.Image:
@@ -134,25 +136,146 @@ def load_image(source) -> Image.Image:
     return image.convert("RGBA")
 
 
-def fit_image(image: Image.Image, box: tuple[float, float], fit: str = "cover",
-              focus: tuple[float, float] = (0.5, 0.5), max_scale: float | None = 2.0) -> tuple[Image.Image, tuple[float, float, float, float]]:
+_analyses: dict = {}
+
+
+def analyze(source) -> dict:
+    """What Apple Vision finds in a picture (path or PIL image), from `comp-render subject`: `faces`, `people`,
+    `subject` (the foreground Remove Background keeps, with its `coverage`) and `salient` boxes, each
+    {x, y, width, height} as fractions of the upright picture from its top-left corner. Cached per file."""
+    if isinstance(source, Image.Image):
+        with tempfile.TemporaryDirectory() as folder:
+            copy = Path(folder) / "picture.png"
+            small = source.copy()
+            small.thumbnail((1536, 1536))
+            small.save(copy)
+            return json.loads(comp_render("subject", copy))
+    path = Path(source).expanduser().resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key not in _analyses:
+        _analyses[key] = json.loads(comp_render("subject", path))
+    return _analyses[key]
+
+
+def _analysis_for(source) -> dict:
+    try:
+        return analyze(source)
+    except (CompError, OSError) as error:
+        print(f"compkit: no subject analysis for {source if not isinstance(source, Image.Image) else 'image'} "
+              f"({error}); cropping around the center", file=sys.stderr)
+        return {}
+
+
+def _as_shot_from(name: str):
+    import re
+    found = re.search(r"as shot (\d+(?:\.\d+)?) K, ([+-]?\d+(?:\.\d+)?)", name)
+    return (float(found.group(1)), float(found.group(2))) if found else None
+
+
+def _label(name: str, source) -> str:
+    return f"{name!r}" + ("" if isinstance(source, Image.Image) else f" ({Path(source).name})")
+
+
+def _union(boxes) -> tuple[float, float, float, float] | None:
+    boxes = [b for b in boxes if b]
+    if not boxes:
+        return None
+    edges = [(b[0], b[1], b[2], b[3]) if isinstance(b, tuple) else (b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"])
+             for b in boxes]
+    return (min(e[0] for e in edges), min(e[1] for e in edges), max(e[2] for e in edges), max(e[3] for e in edges))
+
+
+def auto_focus(analysis: dict, image_size: tuple[int, int], box: tuple[float, float]) -> tuple[float, float]:
+    """Where to crop a picture of `image_size` to fill `box` so what matters stays in frame: the point of the
+    picture (0–1 across, 0–1 down) the crop centers on, as fit_image's `focus`. The subject (Remove Background's foreground, else the people, else where the eye
+    goes) is centered when it fits. When it doesn't, the crop is anchored on what draws the eye within it:
+    - human faces stay whole; when the crop cuts height they sit in the top third, with no empty space above the
+      subject
+    - otherwise Vision's attention saliency (heads and eyes, for animals too) is centered
+    - with neither, the top of the subject is kept when cutting height (where heads are), its middle when
+      cutting width
+    With nothing found at all, the center."""
+    w, h = image_size
+    bw, bh = box
+    target = bw / bh
+    vertical = w / h <= target  # the crop cuts height (True) or width (False)
+    length = (w / target) / h if vertical else (h * target) / w  # the crop's share of the axis it cuts
+    if length >= 1:
+        return (0.5, 0.5)
+    faces = _union([f for f in analysis.get("faces", []) if f.get("confidence", 1) >= 0.5])
+    salient = _union(analysis.get("salient", []))
+    subject = analysis.get("subject")
+    if subject and subject.get("coverage", 1) >= 0.01:
+        region = _union([subject])
+    else:
+        region = _union(analysis.get("people", [])) or salient
+    region = _union([region, faces])
+    anchor = faces or salient
+    axis = 1 if vertical else 0
+    r = (region[axis], region[axis + 2]) if region else None
+    a = (anchor[axis], anchor[axis + 2]) if anchor else None
+    if r is None:
+        start = 0.5 - length / 2
+    elif r[1] - r[0] <= length:
+        start = (r[0] + r[1]) / 2 - length / 2
+    elif a:
+        center = (a[0] + a[1]) / 2
+        if a[1] - a[0] > length:
+            start = center - length / 2
+        else:
+            if faces and vertical:
+                start = max(center - length / 3, r[0])
+            else:
+                start = center - length / 2
+            # Within the subject where possible, and the anchor whole.
+            start = min(max(start, r[0]), r[1] - length)
+            start = max(min(start, a[0]), a[1] - length)
+    else:
+        start = r[0] if vertical else (r[0] + r[1]) / 2 - length / 2
+    start = min(max(start, 0), 1 - length)
+    center = start + length / 2
+    return (0.5, center) if vertical else (center, 0.5)
+
+
+def cover_crop(size: tuple[int, int], box: tuple[float, float], focus: tuple[float, float]) -> tuple[int, int, int, int]:
+    """The (left, top, width, height) of a picture of `size` that fills `box`'s shape, centered on `focus` (a point
+    of the picture, 0–1 across and down) as nearly as the picture's edges allow."""
+    w, h = size
+    target = box[0] / box[1]
+    if w / h > target:
+        cw, ch = max(1, round(h * target)), h
+    else:
+        cw, ch = w, max(1, round(w / target))
+    left = min(max(focus[0] * w - cw / 2, 0), w - cw)
+    top = min(max(focus[1] * h - ch / 2, 0), h - ch)
+    return (round(left), round(top), cw, ch)
+
+
+def fit_image(image: Image.Image, box: tuple[float, float], fit: str = "cover", focus="auto",
+              max_scale: float | None = 2.0, analysis=None, label: str | None = None) -> tuple[Image.Image, tuple[float, float, float, float]]:
     """Fits `image` to a box of `box` size. Returns the pixels to store and where they sit inside the box
     (x, y, width, height, relative to the box's top-left).
 
-    cover    fills the box, cropping the overflow around `focus` (0–1 on each axis; 0.5, 0.5 is the center)
+    cover    fills the box, cropping the overflow: focus='auto' keeps faces and the subject in frame (see
+             auto_focus), or give the point of the picture to center on, (x, y) 0–1 across and down
     contain  fits inside the box, centered
     stretch  fills the box exactly, ignoring aspect ratio
-    The stored pixels keep the source's resolution, capped at `max_scale` times the box's size (None: no cap)."""
+    `analysis` is the picture's analyze() result, or a function returning it, used only when a crop is needed.
+    The stored pixels keep the source's resolution, capped at `max_scale` times the box's size (None: no cap).
+    With a `label`, a picture enlarged more than 1.25× to fill its box is reported on stderr: past about 1.5× it
+    looks soft, and past 2× a bigger original is worth asking for."""
     bw, bh = box
     w, h = image.size
     if fit == "cover":
-        target = bw / bh
-        if w / h > target:
-            cw, ch = max(1, round(h * target)), h
-        else:
-            cw, ch = w, max(1, round(w / target))
-        left = round((w - cw) * min(1, max(0, focus[0])))
-        top = round((h - ch) * min(1, max(0, focus[1])))
+        if focus == "auto":
+            whole = cover_crop((w, h), box, (0.5, 0.5))
+            if (whole[2], whole[3]) == (w, h):
+                focus = (0.5, 0.5)
+            else:
+                found = analysis() if callable(analysis) else analysis
+                focus = auto_focus(found if found is not None else _analysis_for(image), (w, h), box)
+        left, top, cw, ch = cover_crop((w, h), box, focus)
         image = image.crop((left, top, left + cw, top + ch))
         placement = (0, 0, bw, bh)
     elif fit == "contain":
@@ -163,6 +286,11 @@ def fit_image(image: Image.Image, box: tuple[float, float], fit: str = "cover",
         placement = (0, 0, bw, bh)
     else:
         raise CompError(f"fit must be cover, contain or stretch, not {fit!r}")
+    enlarged = max(placement[2] / image.width, placement[3] / image.height)
+    if label and enlarged > 1.25:
+        print(f"compkit: {label} enlarged {enlarged:.1f}× to {'fill' if fit != 'contain' else 'fit inside the frame at'} "
+              f"{placement[2]:g}×{placement[3]:g}"
+              f"{'; a bigger original would be sharper' if enlarged > 1.5 else ''}", file=sys.stderr)
     if max_scale:
         limit = max(1, round(placement[2] * max_scale)), max(1, round(placement[3] * max_scale))
         if image.width > limit[0] and image.height > limit[1]:
@@ -182,6 +310,140 @@ def subject_mask(source, refine: float = 12, contrast: float = 25, shift: float 
         result = Image.open(output)
         result.load()
     return result.convert("RGBA" if cutout else "L")
+
+
+# Lightroom presets ----------------------------------------------------------------------------------------------
+
+ORIGINAL, BASE_GRADE, LOCAL, TUNE = " · Original", " · Base Grade", "Preset · ", "Tune · "
+_reported: set[str] = set()  # preset notes already printed this run
+TUNE_KINDS = ("Exposure", "Curves", "Hue/Saturation", "Color Balance")
+
+
+def read_preset(preset) -> dict:
+    """How a Lightroom / Camera Raw preset (.xmp) maps onto Compositor's Camera Raw (`comp-render preset`): its
+    `name`, `mapped` settings, `whiteBalance` conversion, `notes`, `skipped` (no counterpart), `localCorrections`,
+    and the `fields` that `settings=` can override."""
+    return json.loads(comp_render("preset", Path(preset).expanduser()))
+
+
+def develop(source, preset, output, *, original=None, crop=None, size=None, amount: float = 1.0, as_shot=None,
+            settings: dict | None = None, seed: int = 0) -> dict:
+    """Grades a picture with a preset through Compositor's Camera Raw engine (`comp-render develop`) and writes
+    `output` (PNG). RAW files are decoded as shot first. `original` also writes the ungraded picture; `crop` is
+    (x, y, w, h) in fractions of the upright picture; `size` (w, h) resizes before grading; `amount` 0–2 scales
+    the preset; `settings` overrides Camera Raw fields afterwards ({"exposure": 0.2, "curve.shadows": 5}).
+    Returns the report: preset name, as-shot white balance used, notes and what was skipped."""
+    with tempfile.TemporaryDirectory() as folder:
+        if isinstance(source, Image.Image):
+            path = Path(folder) / "picture.png"
+            source.save(path)
+            source = path
+        args = ["develop", Path(source).expanduser(), Path(preset).expanduser(), Path(output).expanduser()]
+        if original:
+            args += ["--original", Path(original).expanduser()]
+        if crop:
+            args += ["--crop", ",".join(f"{float(v):.6f}" for v in crop)]
+        if size:
+            args += ["--size", f"{int(size[0])}x{int(size[1])}"]
+        if amount != 1:
+            args += ["--amount", f"{float(amount):g}"]
+        if as_shot:
+            args += ["--as-shot", f"{float(as_shot[0]):g},{float(as_shot[1]):g}"]
+        for field, value in (settings or {}).items():
+            args += ["--set", f"{field}={float(value):g}"]
+        if seed:
+            args += ["--seed", str(int(seed))]
+        return json.loads(comp_render(*args))
+
+
+def measure(image, region: str = "frame") -> dict:
+    """Tone and color numbers for tuning to guidelines, in CIELAB (L* 0–100, a*/b* ±; D65): `lightness` mean and
+    percentiles (p5, p25, median, p75, p95), `blown` (% of pixels pure white: detail gone), `channel_clip` (% with
+    any one channel at 255: saturated color hitting the limit), `crushed` (% pure black), `chroma` (mean and p90 saturation), `whites` (L* and a*/b* cast of bright near-neutral pixels, or None)
+    and `cast` (a*/b* of mid-tone near-neutrals). Percentiles stay put as a picture is tuned, unlike averages over
+    a brightness range, so compare those between passes. `region="subject"` measures only what Remove Background
+    would keep."""
+    picture = load_image(image)
+    rgb = np.asarray(picture.convert("RGB"), dtype=np.float64) / 255
+    keep = np.ones(rgb.shape[:2], bool)
+    if region == "subject":
+        keep = np.asarray(subject_mask(picture).resize(picture.size)) > 127
+        if not keep.any():
+            raise CompError("no subject found to measure")
+    elif region != "frame":
+        raise CompError("region is 'frame' or 'subject'")
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    xyz = linear @ np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]).T
+    xyz /= np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+    L = (116 * f[..., 1] - 16)[keep]
+    a = (500 * (f[..., 0] - f[..., 1]))[keep]
+    b = (200 * (f[..., 1] - f[..., 2]))[keep]
+    c = np.hypot(a, b)
+    channels = rgb[keep]
+    round1 = lambda v: round(float(v), 1)
+
+    def neutral(select):
+        if select.mean() < 0.005:
+            return None
+        return {"share": round1(select.mean() * 100), "L": round1(L[select].mean()), "a": round1(a[select].mean()),
+                "b": round1(b[select].mean())}
+
+    return {
+        "region": region, "pixels": int(keep.sum()),
+        "lightness": {"mean": round1(L.mean()), **{name: round1(np.percentile(L, q)) for name, q in
+                                                  (("p5", 5), ("p25", 25), ("median", 50), ("p75", 75), ("p95", 95))}},
+        "blown": round(float((channels >= 254.5 / 255).all(axis=1).mean() * 100), 2),
+        "channel_clip": round(float((channels >= 254.5 / 255).any(axis=1).mean() * 100), 2),
+        "crushed": round(float((channels <= 0.5 / 255).all(axis=1).mean() * 100), 2),
+        "chroma": {"mean": round1(c.mean()), "p90": round1(np.percentile(c, 90))},
+        "whites": neutral((L > 80) & (c < 25)),
+        "cast": neutral((L > 25) & (L < 80) & (c < 12)),
+    }
+
+
+def _local_weight(correction: dict, size: tuple[int, int]) -> np.ndarray | None:
+    """A Lightroom local correction's mask over a frame of `size`, 0–1. Radial and linear gradients are drawn;
+    other mask kinds (brush, subject, sky…) can't be, and give None. Coordinates are taken as fractions of the
+    framed photo, which is what a base preset's gradients are for."""
+    w, h = size
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    fx, fy = (xs + 0.5) / w, (ys + 0.5) / h
+    combined = None
+    for mask in correction["masks"]:
+        what = mask.get("What", "")
+        number = lambda key, default=0.0: float(mask.get(key, default))
+        if what == "Mask/CircularGradient":
+            left, top, right, bottom = number("Left"), number("Top"), number("Right", 1), number("Bottom", 1)
+            cx, cy, rx, ry = (left + right) / 2, (top + bottom) / 2, max(1e-6, (right - left) / 2), max(1e-6, (bottom - top) / 2)
+            angle = math.radians(number("Angle"))
+            dx, dy = fx - cx, fy - cy
+            ux, uy = dx * math.cos(angle) + dy * math.sin(angle), -dx * math.sin(angle) + dy * math.cos(angle)
+            r = np.sqrt((ux / rx) ** 2 + (uy / ry) ** 2)
+            feather = min(max(number("Feather", 50) / 100, 0.001), 1)
+            t = np.clip((1 - r) / feather, 0, 1)
+            inside = t * t * (3 - 2 * t)
+            weight = inside if mask.get("Flipped", "false").lower() == "true" else 1 - inside
+        elif what == "Mask/Gradient":
+            zx, zy, ax, ay = number("ZeroX"), number("ZeroY"), number("FullX"), number("FullY", 1)
+            vx, vy = ax - zx, ay - zy
+            t = np.clip(((fx - zx) * vx + (fy - zy) * vy) / max(1e-9, vx * vx + vy * vy), 0, 1)
+            weight = t * t * (3 - 2 * t)
+        else:
+            return None
+        if mask.get("MaskInverted", "false").lower() == "true":
+            weight = 1 - weight
+        weight = weight * number("MaskValue", 1)
+        mode = mask.get("MaskBlendMode", "0")
+        if combined is None:
+            combined = weight
+        elif mode == "1":
+            combined = combined * (1 - weight)
+        elif mode == "2":
+            combined = np.minimum(combined, weight)
+        else:
+            combined = np.maximum(combined, weight)
+    return None if combined is None else np.clip(combined * correction.get("amount", 1), 0, 1)
 
 
 def _merge(base: dict, overrides: dict) -> dict:
@@ -258,16 +520,55 @@ class Layer:
         self.record["blendMode"] = value
 
     def place(self, x=None, y=None, width=None, height=None, rotation=None, flip_x=None, flip_y=None, sampling=None) -> "Layer":
+        """Moves or scales the layer's box (its transform), in document pixels. A text layer's box sits the text
+        padding (12 px) outside its text; place_text() positions text by the text itself, as add_text does."""
         t = self.transform
-        if x is not None: t["origin"][0] = x
-        if y is not None: t["origin"][1] = y
-        if width is not None: t["size"][0] = width
-        if height is not None: t["size"][1] = height
-        if rotation is not None: t["rotation"] = rotation
+        if x is not None: t["origin"][0] = float(x)
+        if y is not None: t["origin"][1] = float(y)
+        if width is not None: t["size"][0] = float(width)
+        if height is not None: t["size"][1] = float(height)
+        if rotation is not None: t["rotation"] = float(rotation)
         if flip_x is not None: t["flipX"] = flip_x
         if flip_y is not None: t["flipY"] = flip_y
         if sampling is not None: t["sampling"] = sampling
         return self
+
+    def ink_box(self) -> tuple[float, float, float, float] | None:
+        """Where the layer's visible pixels are, as (x, y, width, height) in document pixels (unrotated layers):
+        for text, the letters themselves, for lining them up optically."""
+        pixels = self.pixels()
+        found = pixels.getchannel("A").getbbox() if pixels else None
+        if not found:
+            return None
+        t = self.transform
+        sx, sy = t["size"][0] / pixels.width, t["size"][1] / pixels.height
+        left, top, right, bottom = found
+        return (t["origin"][0] + left * sx, t["origin"][1] + top * sy, (right - left) * sx, (bottom - top) * sy)
+
+    def place_ink(self, x=None, y=None) -> "Layer":
+        """Moves the layer so its visible pixels' top-left (ink_box) lands at x, y: for stacking and aligning text
+        by its letters rather than its padded box."""
+        ink = self.ink_box()
+        if ink is None:
+            raise CompError(f"{self.name!r} has no visible pixels")
+        t = self.transform
+        return self.place(x=None if x is None else t["origin"][0] + x - ink[0],
+                          y=None if y is None else t["origin"][1] + y - ink[1])
+
+    def add_backdrop(self, color, padding=(24, 12), name: str | None = None, opacity: float = 1,
+                     use: str = "ink") -> "Layer":
+        """A solid rectangle just behind this layer, in its folder, sized to its letters (`use="ink"`) or its text
+        area (`use="area"`) plus `padding` (x, y): a badge, pill or label plate. Returns the new layer."""
+        box = self.ink_box() if use == "ink" else self.text_area
+        if box is None:
+            raise CompError(f"{self.name!r} has nothing to put a backdrop behind")
+        px, py = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+        record = self.project._record(name or f"{self.name} Backdrop",
+                                      transform(box[0] - px, box[1] - py, box[2] + 2 * px, box[3] + 2 * py), opacity, "Normal")
+        r, g, b = (round(c * 255) for c in rgb(color))
+        record["imageFile"] = f"{record['id']}.png"
+        self.project._images[record["id"]] = Image.new("RGBA", (max(1, round(box[2] + 2 * px)), max(1, round(box[3] + 2 * py))), (r, g, b, 255))
+        return self.project._add(record, self.parent, None, below=self)
 
     # Pixels
 
@@ -292,11 +593,20 @@ class Layer:
             self.record.pop("text", None)
         return self
 
-    def replace_image(self, source, fit: str = "cover", focus=(0.5, 0.5), max_scale: float | None = 2.0) -> "Layer":
+    def replace_image(self, source, fit: str = "cover", focus="auto", max_scale: float | None = 2.0,
+                      preset=None, amount: float = 1.0, settings: dict | None = None) -> "Layer":
         """Puts a new picture in this layer's box (its current transform), as a template's placeholder: position,
-        rotation, mask, effects, opacity and blend mode all stay."""
+        rotation, mask, effects, opacity and blend mode all stay. focus='auto' crops around faces and the subject
+        (see auto_focus); (x, y) centers the crop on that point. On a graded-photo folder the new picture is graded
+        with `preset` (required there), keeping the tune layers' settings."""
+        if self.graded_parts():
+            if preset is None:
+                raise CompError(f"{self.name!r} is a graded photo: give the preset to grade the new picture with")
+            self.project._grade_into(self, source, preset, focus=focus, max_scale=max_scale, amount=amount, settings=settings)
+            return self
         t = self.transform
-        image, (px, py, pw, ph) = fit_image(load_image(source), tuple(t["size"]), fit, focus, max_scale)
+        image, (px, py, pw, ph) = fit_image(load_image(source), tuple(t["size"]), fit, focus, max_scale,
+                                            analysis=lambda: _analysis_for(source), label=_label(self.name, source))
         if (px, py) != (0, 0):
             # contain: shrink the box around the picture, keeping its center.
             corner = _point(t, (px / t["size"][0], py / t["size"][1]))
@@ -326,6 +636,36 @@ class Layer:
         self.record["maskEnabled"] = enabled
         return self
 
+    # Graded photos (a Lightroom preset applied with the original kept)
+
+    def graded_parts(self) -> dict | None:
+        """For a graded-photo folder (Project.add_graded_photo): its `original`, `graded`, `local` and `tune`
+        layers. None for anything else."""
+        if not self.is_group:
+            return None
+        children = self.project.children(self)
+        original = next((c for c in children if ORIGINAL in c.name), None)
+        graded = next((c for c in children if BASE_GRADE in c.name), None)
+        if not original or not graded:
+            return None
+        return {"original": original, "graded": graded,
+                "local": [c for c in children if c.name.startswith(LOCAL)],
+                "tune": [c for c in children if c.name.startswith(TUNE)]}
+
+    def regrade(self, preset, amount: float = 1.0, settings: dict | None = None) -> dict:
+        """Grades a graded-photo folder again from its kept original: another preset, strength or Camera Raw
+        overrides (`settings`). Tune layers keep their settings; the preset's local corrections are rebuilt."""
+        parts = self.graded_parts()
+        if not parts:
+            raise CompError(f"{self.name!r} is not a graded photo (see Project.add_graded_photo)")
+        as_shot = _as_shot_from(parts["original"].name)
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / "graded.png"
+            report = develop(parts["original"].pixels(), preset, out, amount=amount, as_shot=as_shot, settings=settings)
+            parts["graded"].set_pixels(Image.open(out))
+        self.project._finish_graded(self, parts["graded"], report, preset, amount, settings=settings)
+        return report
+
     def mask_subject(self, refine: float = 12, contrast: float = 25, shift: float = 0) -> "Layer":
         """Remove Background as a layer mask: hides everything but the subject Apple Vision finds in the layer's
         pixels, without erasing them (paint the mask in Compositor to fix it up)."""
@@ -336,26 +676,93 @@ class Layer:
 
     # Text
 
-    def set_text(self, content: str | None = None, **style) -> "Layer":
+    def set_text(self, content: str | None = None, shrink_to_fit: bool = False, min_size: float | None = None,
+                 max_width: float | None = None, **style) -> "Layer":
         """Changes a text layer's words or style (font, size, color, align, tracking, leading, box) and sets its
-        pixels again with the app's typesetter, keeping its top-left corner, scale and rotation as the app does."""
+        pixels again with the app's typesetter, keeping its top-left corner, scale and rotation as the app does.
+
+        shrink_to_fit steps the size down (spacing with it) until the words fit: inside the paragraph box for box
+        text, or for point text within `max_width` layer pixels (default: the canvas less the same margin on the
+        right as the text has on the left). It stops at `min_size` (default 40% of the size) and warns."""
         if not self.text:
             raise CompError(f"{self.name!r} is not a text layer")
         old = self.text
         new = _text_style(old, content, style)
         image, placement = _typeset(new)
+        new = placement.pop("style")
         old_pixels = self.pixels()
         t = self.transform
+        if shrink_to_fit:
+            if new.get("boxSize") is None and max_width is None and not t.get("rotation") and old_pixels:
+                scale = t["size"][0] / old_pixels.width
+                left = t["origin"][0] + placement["padding"] * scale
+                max_width = (self.project.width - 2 * left) / scale if left < self.project.width / 2 else None
+
+            def too_big(found):
+                if new.get("boxSize") is not None:
+                    return found["overflow"]
+                return max_width is not None and found["textWidth"] > max_width
+
+            start = new["fontSize"]
+            floor = min_size or start * 0.4
+            while too_big(placement) and new["fontSize"] > floor:
+                ratio = max(floor, round(new["fontSize"] * 0.94, 1)) / new["fontSize"]
+                new["fontSize"] = round(new["fontSize"] * ratio, 1)
+                new["leading"] = round(new.get("leading", 0) * ratio, 1)
+                new["tracking"] = round(new.get("tracking", 0) * ratio, 2)
+                image, placement = _typeset(new)
+                new = placement.pop("style")
+            if new["fontSize"] != start:
+                print(f"compkit: {self.name!r} set at {new['fontSize']:g}px (from {start:g}) to fit", file=sys.stderr)
+            if too_big(placement):
+                print(f"compkit: {self.name!r} still doesn't fit at {new['fontSize']:g}px", file=sys.stderr)
+        elif placement["overflow"]:
+            print(f"compkit: {self.name!r} doesn't fit its box at {new['fontSize']:g}px; it's cut off (pass "
+                  f"box=(w, None) to refit an auto-height box, or shrink_to_fit=True)", file=sys.stderr)
         anchor = _point(t, (0, 0))
-        if new.get("boxSize") is None or old.get("boxSize") is None:
-            sx = t["size"][0] / old_pixels.width if old_pixels else 1
-            sy = t["size"][1] / old_pixels.height if old_pixels else 1
-            t["size"] = [image.width * sx, image.height * sy]
-            moved = _point(t, (0, 0))
-            t["origin"] = [t["origin"][0] + anchor[0] - moved[0], t["origin"][1] + anchor[1] - moved[1]]
+        # The layer keeps its scale and top-left corner as the pixels change size (a new box, or point text that
+        # grew or shrank), so the text is never stretched.
+        sx = t["size"][0] / old_pixels.width if old_pixels else 1
+        sy = t["size"][1] / old_pixels.height if old_pixels else 1
+        t["size"] = [image.width * sx, image.height * sy]
+        moved = _point(t, (0, 0))
+        t["origin"] = [t["origin"][0] + anchor[0] - moved[0], t["origin"][1] + anchor[1] - moved[1]]
         self.project._images[self.id] = image
         self.record["text"] = new
         return self
+
+    def text_metrics(self) -> dict:
+        """How the app sets this text layer now: `width`/`height` of its pixels, `padding`, `baseline` (first
+        baseline below the pixels' top), `textWidth`/`textHeight` (the lines themselves) and `overflow` (lines cut
+        off by the box). In layer pixels."""
+        if not self.text:
+            raise CompError(f"{self.name!r} is not a text layer")
+        _, placement = _typeset(self.text)
+        placement.pop("style")
+        return placement
+
+    @property
+    def text_area(self) -> tuple[float, float, float, float]:
+        """The text's own area as (x, y, width, height) in document pixels (unrotated layers): the paragraph box
+        inside its padding, or for point text the lines as set — what add_text's x, y and box describe."""
+        found = self.text_metrics()
+        t, pad = self.transform, found["padding"]
+        sx, sy = t["size"][0] / found["width"], t["size"][1] / found["height"]
+        if self.text.get("boxSize"):
+            w, h = found["width"] - 2 * pad, found["height"] - 2 * pad
+        else:
+            w, h = found["textWidth"], found["textHeight"]
+        return (t["origin"][0] + pad * sx, t["origin"][1] + pad * sy, w * sx, h * sy)
+
+    def place_text(self, x=None, y=None) -> "Layer":
+        """Moves a text layer so its text area's top-left is at x, y (document pixels), as add_text places it."""
+        if not self.text:
+            raise CompError(f"{self.name!r} is not a text layer")
+        pad, t = defaults()["textPadding"], self.transform
+        pixels = self.pixels()
+        sx = t["size"][0] / pixels.width if pixels else 1
+        sy = t["size"][1] / pixels.height if pixels else 1
+        return self.place(x=None if x is None else x - pad * sx, y=None if y is None else y - pad * sy)
 
     # Effects
 
@@ -409,23 +816,40 @@ def _text_style(base: dict, content: str | None, style: dict) -> dict:
         elif key == "alignment":
             result[key] = value.capitalize()
         elif key == "box":
+            # The box is the text's own area; the app's record holds it with its padding added.
             if value is None:
                 result.pop("boxSize", None)
             else:
-                result["boxSize"] = [value[0], value[1]]
+                pad = defaults()["textPadding"]
+                result["boxSize"] = [float(value[0]) + 2 * pad, None if value[1] is None else float(value[1]) + 2 * pad]
         else:
             result[key] = value
     return result
 
 
 def _typeset(style: dict) -> tuple[Image.Image, dict]:
+    """The text's pixels and placement from the app's typesetter. A box of height None is first made as tall as
+    the lines need; the style as set is returned under placement["style"]."""
+    style = copy.deepcopy(style)
+    box = style.get("boxSize")
+    if box is not None and box[1] is None:
+        box[1] = 16
+        measured = json.loads(_run_typesetter(style)[1])
+        box[1] = math.ceil(measured["textHeight"]) + 2 * measured["padding"]
+    image, output = _run_typesetter(style)
+    placement = json.loads(output)
+    placement["style"] = style
+    return image, placement
+
+
+def _run_typesetter(style: dict) -> tuple[Image.Image, str]:
     with tempfile.TemporaryDirectory() as folder:
         style_file, png = Path(folder) / "style.json", Path(folder) / "text.png"
         style_file.write_text(json.dumps(style))
-        placement = json.loads(comp_render("text", style_file, png))
+        output = comp_render("text", style_file, png)
         image = Image.open(png).convert("RGBA")
         image.load()
-    return image, placement
+    return image, output
 
 
 def _adjustment_settings(settings: dict) -> dict:
@@ -504,7 +928,7 @@ class Project:
         parent = group.id if group else None
         return [layer for layer in self.layers if layer.record.get("parentID") == parent]
 
-    def _add(self, record: dict, parent: Layer | None, above: Layer | None) -> Layer:
+    def _add(self, record: dict, parent: Layer | None, above: Layer | None, below: Layer | None = None) -> Layer:
         if parent is not None:
             if not parent.is_group:
                 raise CompError(f"{parent.name!r} is not a folder")
@@ -512,6 +936,8 @@ class Project:
         layers = self.manifest["layers"]
         if above is not None:
             index = next(i for i, r in enumerate(layers) if r["id"] == above.id) + 1
+        elif below is not None:
+            index = next(i for i, r in enumerate(layers) if r["id"] == below.id)
         else:
             index = len(layers)
         layers.insert(index, record)
@@ -528,10 +954,10 @@ class Project:
 
     def add_image(self, source, name: str | None = None, *, x: float = 0, y: float = 0,
                   width: float | None = None, height: float | None = None, fit: str | None = "cover",
-                  focus=(0.5, 0.5), max_scale: float | None = 2.0, opacity: float = 1, blend: str = "Normal",
+                  focus="auto", max_scale: float | None = 2.0, opacity: float = 1, blend: str = "Normal",
                   parent: Layer | None = None, above: Layer | None = None) -> Layer:
         """Adds a picture. With no box it fills the canvas (fit='cover'); give x, y, width, height for a box.
-        fit=None places it at its own pixel size at x, y."""
+        fit=None places it at its own pixel size at x, y. focus='auto' crops around faces and the subject."""
         image = load_image(source)
         if name is None:
             name = Path(source).stem if not isinstance(source, Image.Image) else "Layer"
@@ -540,7 +966,8 @@ class Project:
         else:
             bw = width if width is not None else (self.width if height is None else image.width * height / image.height)
             bh = height if height is not None else (self.height if width is None else image.height * width / image.width)
-            image, (px, py, pw, ph) = fit_image(image, (bw, bh), fit, focus, max_scale)
+            image, (px, py, pw, ph) = fit_image(image, (bw, bh), fit, focus, max_scale,
+                                                analysis=lambda: _analysis_for(source), label=_label(name, source))
             box = (x + px, y + py, pw, ph)
         record = self._record(name, transform(*box), opacity, blend)
         record["imageFile"] = f"{record['id']}.png"
@@ -593,14 +1020,19 @@ class Project:
         font     a PostScript name, e.g. 'Helvetica-Bold', 'Futura-CondensedExtraBold', 'SFProDisplay-Black'
         tracking extra space between letters in pixels (AppKit kern; not Photoshop's thousandths of an em)
         leading  baseline to baseline in pixels; 0 is auto (120% of size)
-        box      (width, height) makes paragraph text that wraps inside the box; x, y is then the box's top-left
+        box      (width, height) makes paragraph text that wraps within that area, whose top-left is x, y; a
+                 height of None makes the box as tall as the text needs. Text that doesn't fit is reported
         anchor   for point text: 'baseline' puts the first baseline at y, starting at x (center/right
                  alignment: x is the line's center/right end), as a click with the Type tool does;
                  'top-left' puts the text's top-left at x, y"""
         style = _text_style(defaults()["text"], content, {"font": font, "size": size, "color": color, "align": align,
                                                            "tracking": tracking, "leading": leading, "box": box})
         image, placement = _typeset(style)
+        style = placement.pop("style")
         pad = placement["padding"]
+        if placement["overflow"]:
+            print(f"compkit: {name or content[:30]!r} doesn't fit its box at {size:g}px; it's cut off "
+                  f"(give the box more height, or set_text(..., shrink_to_fit=True))", file=sys.stderr)
         if box is not None:
             ox, oy = x - pad, y - pad
         elif anchor == "baseline":
@@ -636,6 +1068,157 @@ class Project:
         record["isGroup"] = True
         return self._add(record, parent, above)
 
+    def add_graded_photo(self, source, preset, name: str = "Photo", *, x: float = 0, y: float = 0,
+                         width: float | None = None, height: float | None = None, fit: str = "cover", focus="auto",
+                         max_scale: float | None = 2.0, amount: float = 1.0, settings: dict | None = None,
+                         local: bool = True, tune: bool = True, parent: Layer | None = None,
+                         above: Layer | None = None) -> Layer:
+        """A photo with a Lightroom / Camera Raw preset (.xmp) applied as its base grade, kept adjustable. Makes a
+        folder `name` holding, bottom to top:
+          `<name> · Original`        the photo, ungraded and hidden (kept to grade again from)
+          `<name> · Base Grade (…)`  the preset applied by Compositor's Camera Raw engine
+          `Preset · …`               the preset's radial/linear local corrections, as masked Exposure layers
+          `Tune · Exposure/Curves/Hue/Saturation/Color Balance`  neutral adjustment layers to fine-tune with
+        The folder keeps the grade and tuning to this photo. Placement and cropping work as in add_image
+        (cover or contain); `amount` 0–2 scales the preset; `settings` overrides Camera Raw fields."""
+        group = self.add_group(name, parent=parent, above=above)
+        self._grade_into(group, source, preset, x=x, y=y, width=width, height=height, fit=fit, focus=focus,
+                         max_scale=max_scale, amount=amount, settings=settings, local=local, tune=tune)
+        return group
+
+    def grade_layer(self, layer: Layer, preset, source=None, *, focus="auto", amount: float = 1.0,
+                    settings: dict | None = None, max_scale: float | None = 2.0) -> Layer:
+        """Turns a plain picture layer into a graded-photo folder of the same name, in the same place: graded from
+        `source` (a new picture, cropped into the layer's box) or, without one, from the layer's own pixels. A
+        layer mask moves onto the folder; layer effects are dropped (a folder can't carry them)."""
+        if layer.graded_parts():
+            if source is not None:
+                layer.replace_image(source, focus=focus, preset=preset, amount=amount, settings=settings)
+            else:
+                layer.regrade(preset, amount=amount, settings=settings)
+            return layer
+        if layer.is_group or layer.adjustment or not layer.record.get("imageFile"):
+            raise CompError(f"{layer.name!r} has no picture to grade")
+        t = layer.transform
+        if t.get("rotation") or t.get("flipX") or t.get("flipY"):
+            raise CompError(f"{layer.name!r} is rotated or flipped; grade it in an unrotated box")
+        group = self.add_group(layer.name, parent=layer.parent, above=layer)
+        group.opacity = layer.opacity
+        picture = source if source is not None else layer.pixels()
+        self._grade_into(group, picture, preset, x=t["origin"][0], y=t["origin"][1], width=t["size"][0],
+                         height=t["size"][1], focus=focus if source is not None else (0.5, 0.5), max_scale=max_scale,
+                         amount=amount, settings=settings)
+        if layer.record.get("maskFile"):
+            mask = self._masks.get(layer.id) or Image.open(self.path / "images" / layer.record["maskFile"])
+            group.set_mask(mask, enabled=layer.record.get("maskEnabled", True))
+        if layer.record.get("effects"):
+            print(f"compkit: {layer.name!r}: its layer effects don't carry over to the graded folder", file=sys.stderr)
+        self.remove(layer)
+        return group
+
+    def _grade_into(self, group: Layer, source, preset, *, x=None, y=None, width=None, height=None, fit="cover",
+                    focus="auto", max_scale=2.0, amount=1.0, settings=None, local=True, tune=True) -> dict:
+        parts = group.graded_parts()
+        found = _analysis_for(source)
+        if found.get("width"):
+            size = (found["width"], found["height"])
+        else:
+            size = load_image(source).size
+        if parts:  # a new picture for an existing graded photo: same box
+            t = parts["original"].transform
+            bx, by, bw, bh = t["origin"][0], t["origin"][1], t["size"][0], t["size"][1]
+        else:
+            bw = width if width is not None else (self.width if height is None else size[0] * height / size[1])
+            bh = height if height is not None else (self.height if width is None else size[1] * width / size[0])
+            bx, by = x or 0, y or 0
+        w, h = size
+        if fit == "cover":
+            if focus == "auto":
+                focus = auto_focus(found, size, (bw, bh)) if found else (0.5, 0.5)
+            left, top, cw, ch = cover_crop(size, (bw, bh), focus)
+            crop = (left / w, top / h, cw / w, ch / h)
+            placement = (bx, by, bw, bh)
+        elif fit == "contain":
+            left, top, cw, ch, crop = 0, 0, w, h, None
+            scale = min(bw / w, bh / h)
+            placement = (bx + (bw - w * scale) / 2, by + (bh - h * scale) / 2, w * scale, h * scale)
+        else:
+            raise CompError("a graded photo is fitted with cover or contain")
+        enlarged = placement[2] / cw
+        if enlarged > 1.25:
+            print(f"compkit: {group.name!r} ({Path(source).name if not isinstance(source, Image.Image) else 'image'}) "
+                  f"enlarged {enlarged:.1f}× to fill {placement[2]:g}×{placement[3]:g}"
+                  f"{'; a bigger original would be sharper' if enlarged > 1.5 else ''}", file=sys.stderr)
+        keep = min(1.0, (max_scale * placement[2] / cw) if max_scale else 1.0)
+        stored = (max(1, round(cw * keep)), max(1, round(ch * keep)))
+        with tempfile.TemporaryDirectory() as folder:
+            original_png, graded_png = Path(folder) / "original.png", Path(folder) / "graded.png"
+            report = develop(source, preset, graded_png, original=original_png, crop=crop, size=stored,
+                             amount=amount, settings=settings)
+            original_pixels, graded_pixels = Image.open(original_png), Image.open(graded_png)
+            original_pixels.load(); graded_pixels.load()
+        as_shot = report.get("asShot")
+        original_name = f"{group.name}{ORIGINAL}" + (f" (as shot {as_shot[0]:.0f} K, {as_shot[1]:+.0f})" if as_shot else "")
+        box = transform(*placement)
+        if parts:
+            parts["original"].name = original_name
+            parts["original"].set_pixels(original_pixels)
+            parts["original"].record["transform"] = box
+            parts["graded"].set_pixels(graded_pixels)
+            parts["graded"].record["transform"] = box
+            graded = parts["graded"]
+        else:
+            group.record["transform"] = copy.deepcopy(box)
+            original = self.add_image(original_pixels, original_name, fit=None, parent=group)
+            original.record["transform"] = copy.deepcopy(box)
+            original.visible = False
+            graded = self.add_image(graded_pixels, f"{group.name}{BASE_GRADE}", fit=None, parent=group)
+            graded.record["transform"] = copy.deepcopy(box)
+            if tune:
+                for kind in TUNE_KINDS:
+                    layer = self.add_adjustment(kind, f"{TUNE}{kind}", parent=group)
+                    layer.record["transform"] = copy.deepcopy(box)
+        self._finish_graded(group, graded, report, preset, amount, local=local, settings=settings)
+        return report
+
+    def _finish_graded(self, group: Layer, graded: Layer, report: dict, preset, amount: float, local: bool = True,
+                       settings: dict | None = None) -> None:
+        """Names the base grade after its preset, strength and overrides, and rebuilds the preset's local
+        corrections above it."""
+        details = [report["preset"] + ("" if amount == 1 else f" at {amount:.0%}")]
+        details += [f"{field} {value:+g}" for field, value in (settings or {}).items()]
+        graded.name = f"{group.name}{BASE_GRADE} ({', '.join(details)})"
+        for layer in group.graded_parts()["local"]:
+            self.remove(layer)
+        box = graded.transform
+        notes = []
+        if local:
+            above = graded
+            for correction in read_preset(preset)["localCorrections"]:
+                if not correction["active"]:
+                    continue
+                stops = correction["settings"].get("LocalExposure2012", 0) * amount
+                others = [k for k, v in correction["settings"].items()
+                          if v and k not in ("LocalExposure2012", "LocalCurveRefineSaturation")]
+                if others:
+                    notes.append(f"local correction {correction['name']!r}: only its exposure is kept ({', '.join(others)} aren't)")
+                long = max(box["size"])
+                weight = _local_weight(correction, (max(1, round(512 * box["size"][0] / long)), max(1, round(512 * box["size"][1] / long))))
+                if weight is None:
+                    notes.append(f"local correction {correction['name']!r}: its mask kind can't be drawn here")
+                    continue
+                if not stops:
+                    continue
+                layer = self.add_adjustment("Exposure", f"{LOCAL}{correction['name']} ({stops:+.2f} EV)",
+                                            exposureSettings={"exposure": round(stops, 4)}, parent=group, above=above)
+                layer.record["transform"] = copy.deepcopy(box)
+                layer.set_mask((weight * 255).round().astype(np.uint8))
+                above = layer
+        for line in notes + [f"{report['preset']}: {item}" for item in report.get("skipped", [])]:
+            if line not in _reported:
+                _reported.add(line)
+                print(f"compkit: {line}", file=sys.stderr)
+
     def remove(self, layer: Layer) -> None:
         """Removes a layer, and everything inside it if it's a folder."""
         doomed = {layer.id}
@@ -654,20 +1237,31 @@ class Project:
         if self.manifest.get("activeLayerID") in doomed:
             self.manifest["activeLayerID"] = self.manifest["layers"][-1]["id"] if self.manifest["layers"] else None
 
-    def move(self, layer: Layer, above: Layer | None = None, to_top: bool = False) -> None:
-        """Moves a layer just above another (within that one's folder), or to the top of the stack."""
+    def move(self, layer: Layer, above: Layer | None = None, below: Layer | None = None, to_top: bool = False,
+             to_bottom: bool = False) -> None:
+        """Moves a layer just above or below another (joining that one's folder), or to the top or bottom of its
+        own folder (of the whole stack, for a layer outside any folder)."""
         layers = self.manifest["layers"]
         layers.remove(layer.record)
-        if to_top or above is None:
-            layers.append(layer.record)
-            layer.record.pop("parentID", None)
-        else:
-            index = next(i for i, r in enumerate(layers) if r["id"] == above.id) + 1
+        parent = layer.record.get("parentID")
+        if above is not None or below is not None:
+            other = above if above is not None else below
+            index = next(i for i, r in enumerate(layers) if r["id"] == other.id) + (1 if above is not None else 0)
             layers.insert(index, layer.record)
-            if above.record.get("parentID"):
-                layer.record["parentID"] = above.record["parentID"]
+            if other.record.get("parentID"):
+                layer.record["parentID"] = other.record["parentID"]
             else:
                 layer.record.pop("parentID", None)
+        elif to_top or to_bottom:
+            siblings = [i for i, r in enumerate(layers) if r.get("parentID") == parent]
+            if not siblings:
+                layers.append(layer.record)
+            elif to_top:
+                layers.insert(siblings[-1] + 1, layer.record)
+            else:
+                layers.insert(siblings[0], layer.record)
+        else:
+            raise CompError("move needs above=, below=, to_top=True or to_bottom=True")
 
     def add_guide(self, axis: str, position: float) -> None:
         if axis not in ("horizontal", "vertical"):

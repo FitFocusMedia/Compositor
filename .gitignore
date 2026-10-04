@@ -29,3 +29,4 @@ automation/.build/
 automation/bin/
 automation/examples/out/
 __pycache__/
+automation/test-results/

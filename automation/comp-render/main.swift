@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import Vision
 
 // comp-render: Compositor's own loader, renderer and typesetter as a command-line tool, so scripts and agents can
 // check, flatten and set type for .comp projects without the app open. Output matches the app's exactly.
@@ -18,14 +19,36 @@ usage:
       validates, then prints the manifest as JSON
   comp-render text <style.json> <output.png>
       sets a text layer's pixels with the app's typesetter from its `text` style (the manifest's text record) and
-      prints {"width", "height", "padding", "baseline"} as JSON: the PNG's size and, for placing point text, how far
-      the first baseline sits below the image's top edge and the text's left edge from its left edge
+      prints {"width", "height", "padding", "baseline", "textWidth", "textHeight", "overflow"} as JSON: the PNG's
+      size; for placing point text, how far the first baseline sits below the image's top edge and the text's left
+      edge from its left edge; the size the set lines take; and whether they run past a paragraph box (cut off)
+  comp-render fonts [text]
+      installed fonts as "PostScriptName<TAB>Family Face" lines (the name a text style takes), optionally only
+      those whose names contain the text
   comp-render defaults
       prints the app's default adjustment, effect and text records and its blend mode names as JSON
   comp-render cutout <picture> <output.png> [--mask] [--refine 0-40] [--contrast 0-100] [--shift -10-10] [--basic]
       Remove Background: the picture with its background transparent, or with --mask the grayscale subject mask
       (white over the subject) to use as a layer mask. Refines edges as the app's Advanced mode (refine 12,
       contrast 25, shift 0); --basic takes Vision's mask as it comes
+  comp-render preset <preset.xmp>
+      how a Lightroom / Camera Raw preset maps onto Compositor's Camera Raw filter, as JSON: what was mapped
+      where, approximations, what has no counterpart, the white balance conversion and its local corrections
+  comp-render develop <picture> <preset.xmp> <graded.png> [options]
+      applies the preset with Compositor's Camera Raw engine. RAW files are decoded as shot first.
+      --original <out.png>      also write the picture as decoded, cropped and sized but ungraded
+      --crop <x,y,w,h>          crop first, in fractions of the upright picture (0–1)
+      --size <WxH>              then resize to exactly this many pixels
+      --amount <0-2>            preset strength (default 1)
+      --as-shot <kelvin,tint>   the picture's own white balance, when it's known (RAW files report theirs)
+      --set <field=value>       override a Camera Raw field after the preset (repeatable), e.g. exposure=0.3,
+                                clarity=10, curve.shadows=5, mixer.saturation.orange=-10 (see `preset` output)
+      --seed <n>                grain pattern (default 0)
+      prints JSON: the as-shot white balance used, notes and what was skipped
+  comp-render subject <picture>
+      what Apple Vision finds in a picture, as JSON boxes in fractions of the picture from its top-left corner:
+      faces, people (whole bodies), subject (the foreground Remove Background keeps, with its share of the
+      picture) and salient (where the eye goes). Used to crop around what matters
 """
 
 func fail(_ message: String) -> Never {
@@ -53,6 +76,33 @@ func write(_ image: CGImage, as type: UTType, to url: URL, properties: [CFString
     guard CGImageDestinationFinalize(destination) else { fail("comp-render: could not encode") }
     do { try (data as Data).write(to: url, options: .atomic) }
     catch { fail("comp-render: \(url.path): \(error.localizedDescription)") }
+}
+
+/// A picture file as an imported picture is: upright (EXIF orientation applied) and drawn into sRGB, and with
+/// `maxSide` scaled down so its longer side fits.
+func loadPicture(_ path: String, maxSide: Int? = nil) -> CGImage {
+    let url = URL(fileURLWithPath: path)
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let pixelWidth = properties[kCGImagePropertyPixelWidth] as? Int, let pixelHeight = properties[kCGImagePropertyPixelHeight] as? Int,
+          let oriented = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: min(maxSide ?? .max, max(pixelWidth, pixelHeight)),
+            kCGImageSourceShouldCacheImmediately: true
+          ] as CFDictionary),
+          let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let canvas = CGContext(data: nil, width: oriented.width, height: oriented.height, bitsPerComponent: 8,
+                                 bytesPerRow: oriented.width * 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        fail("comp-render: \(url.path): not a picture macOS can read")
+    }
+    canvas.draw(oriented, in: CGRect(x: 0, y: 0, width: oriented.width, height: oriented.height))
+    guard let picture = canvas.makeImage() else { fail("comp-render: \(url.path): could not read the picture") }
+    return picture
+}
+
+func loadPreset(_ path: String) -> LightroomPreset {
+    do { return try LightroomPreset(url: URL(fileURLWithPath: path)) }
+    catch { fail("comp-render: \(path): not a Lightroom / Camera Raw preset (.xmp) this can read") }
 }
 
 var arguments = Array(CommandLine.arguments.dropFirst())
@@ -87,9 +137,36 @@ case "text":
     write(image, as: .png, to: URL(fileURLWithPath: arguments[1]))
     // Where a click puts the first baseline, as the Type tool does: padding plus one line, less the font's descent.
     let descent = abs((EditorSession.textAttributes(style)[.font] as? NSFont)?.descender ?? 0)
-    struct Placement: Encodable { let width: Int, height: Int, padding: Double, baseline: Double }
+    // The lines as the typesetter lays them out, unbounded in height, to tell whether a paragraph box cuts them off.
+    let storage = NSTextStorage(attributedString: EditorSession.attributedText(style))
+    let layout = NSLayoutManager()
+    let container = NSTextContainer(size: CGSize(width: style.boxSize.map { max(1, $0.width - 2 * LayerTextStyle.padding) } ?? 100_000,
+                                                 height: 100_000))
+    container.lineFragmentPadding = 0
+    storage.addLayoutManager(layout)
+    layout.addTextContainer(container)
+    layout.ensureLayout(for: container)
+    let used = layout.usedRect(for: container)
+    struct Placement: Encodable {
+        let width: Int, height: Int, padding: Double, baseline: Double
+        let textWidth: Double, textHeight: Double, overflow: Bool
+    }
     printJSON(Placement(width: image.width, height: image.height, padding: LayerTextStyle.padding,
-                        baseline: LayerTextStyle.padding + style.lineHeight - descent))
+                        baseline: LayerTextStyle.padding + style.lineHeight - descent,
+                        textWidth: used.width, textHeight: used.height,
+                        overflow: style.boxSize.map { used.height > $0.height - 2 * LayerTextStyle.padding + 0.5 } ?? false))
+
+case "fonts":
+    let query = arguments.first?.lowercased()
+    for family in NSFontManager.shared.availableFontFamilies {
+        for member in NSFontManager.shared.availableMembers(ofFontFamily: family) ?? [] {
+            guard let name = member.first as? String else { continue }
+            let face = member.count > 1 ? (member[1] as? String ?? "") : ""
+            let line = "\(name)\t\(family) \(face)"
+            if let query, !line.lowercased().contains(query) { continue }
+            print(line)
+        }
+    }
 
 case "defaults":
     // The app's own new-record values, so writers start from exactly what its decoder expects: every non-optional
@@ -156,23 +233,8 @@ case "cutout":
         }
     }
     guard positional.count == 2 else { fail(usage) }
-    let inputURL = URL(fileURLWithPath: positional[0])
-    // Upright (EXIF orientation applied) and in sRGB, as an imported picture is.
-    guard let source = CGImageSourceCreateWithURL(inputURL as CFURL, nil),
-          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-          let pixelWidth = properties[kCGImagePropertyPixelWidth] as? Int, let pixelHeight = properties[kCGImagePropertyPixelHeight] as? Int,
-          let oriented = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-            kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(pixelWidth, pixelHeight), kCGImageSourceShouldCacheImmediately: true
-          ] as CFDictionary),
-          let space = CGColorSpace(name: CGColorSpace.sRGB),
-          let canvas = CGContext(data: nil, width: oriented.width, height: oriented.height, bitsPerComponent: 8,
-                                 bytesPerRow: oriented.width * 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-        fail("comp-render: \(inputURL.path): not a picture macOS can read")
-    }
-    let bounds = CGRect(x: 0, y: 0, width: oriented.width, height: oriented.height)
-    canvas.draw(oriented, in: bounds)
-    guard let picture = canvas.makeImage() else { fail("comp-render: could not read the picture") }
+    let picture = loadPicture(positional[0])
+    let bounds = CGRect(x: 0, y: 0, width: picture.width, height: picture.height)
     let mask: CGImage
     do { mask = try SubjectRemoval.subjectMask(picture, under: nil, settings: settings) }
     catch { fail("comp-render: \(error.localizedDescription)") }
@@ -180,7 +242,9 @@ case "cutout":
     if maskOnly {
         write(mask, as: .png, to: outputURL)
     } else {
-        canvas.clear(bounds)
+        guard let canvas = CGContext(data: nil, width: picture.width, height: picture.height, bitsPerComponent: 8,
+                                     bytesPerRow: picture.width * 4, space: picture.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { fail("comp-render: could not render the cutout") }
         canvas.saveGState()
         canvas.clip(to: bounds, mask: mask)
         canvas.draw(picture, in: bounds)
@@ -189,6 +253,176 @@ case "cutout":
         write(cutout, as: .png, to: outputURL)
     }
     print("\(outputURL.path) \(mask.width)×\(mask.height)")
+
+case "preset":
+    guard arguments.count == 1 else { fail(usage) }
+    let preset = loadPreset(arguments[0])
+    let mapping = PresetMapping(preset, amount: 1, asShot: nil)
+    struct Report: Encodable {
+        let name: String, look: String?
+        let mapped: [PresetMapping.Entry], whiteBalance: PresetMapping.WhiteBalance?
+        let notes: [String], skipped: [String], localCorrections: [LightroomPreset.LocalCorrection]
+        let fields: [String]
+    }
+    printJSON(Report(name: preset.name, look: preset.look, mapped: mapping.mapped, whiteBalance: mapping.whiteBalance,
+                     notes: mapping.notes, skipped: mapping.skipped, localCorrections: preset.corrections,
+                     fields: CameraRawFields.paths.keys.sorted()))
+
+case "develop":
+    var positional: [String] = []
+    var originalPath: String?, crop: CGRect?, size: (Int, Int)?, amount = 1.0, givenAsShot: (Double, Double)?
+    var overrides: [(String, Double)] = [], seed: UInt32 = 0
+    while !arguments.isEmpty {
+        let argument = arguments.removeFirst()
+        func value() -> String {
+            guard !arguments.isEmpty else { fail(usage) }
+            return arguments.removeFirst()
+        }
+        func numbers(_ text: String, _ count: Int, _ separator: Character = ",") -> [Double] {
+            let parts = text.split(separator: separator).compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            guard parts.count == count else { fail("\(argument) takes \(count) numbers, as in its usage") }
+            return parts
+        }
+        switch argument {
+        case "--original": originalPath = value()
+        case "--crop":
+            let n = numbers(value(), 4)
+            crop = CGRect(x: n[0], y: n[1], width: n[2], height: n[3])
+        case "--size":
+            let n = numbers(value().lowercased(), 2, "x")
+            size = (Int(n[0]), Int(n[1]))
+        case "--amount":
+            guard let number = Double(value()), (0...2).contains(number) else { fail("--amount takes 0 to 2") }
+            amount = number
+        case "--as-shot":
+            let n = numbers(value(), 2)
+            givenAsShot = (n[0], n[1])
+        case "--set":
+            let pair = value().split(separator: "=", maxSplits: 1).map(String.init)
+            guard pair.count == 2, CameraRawFields.paths[pair[0]] != nil, let number = Double(pair[1]) else {
+                fail("--set takes field=number with a field from `comp-render preset`'s \"fields\"")
+            }
+            overrides.append((pair[0], number))
+        case "--seed":
+            guard let number = UInt32(value()) else { fail("--seed takes a whole number") }
+            seed = number
+        default: positional.append(argument)
+        }
+    }
+    guard positional.count == 3 else { fail(usage) }
+    let preset = loadPreset(positional[1])
+    let pictureURL = URL(fileURLWithPath: positional[0])
+    var picture: CGImage
+    var asShot = givenAsShot
+    if RawImporter.matches(pictureURL), let neutral = RawImporter.asShot(pictureURL) {
+        // Decoded as shot: the preset's white balance is then reached from the camera's own reading.
+        do { picture = try RawImporter.develop(pictureURL, settings: neutral) }
+        catch { fail("comp-render: \(pictureURL.path): this RAW file couldn't be decoded") }
+        asShot = asShot ?? (Double(neutral.temperature), Double(neutral.tint))
+    } else {
+        picture = loadPicture(positional[0])
+    }
+    if let crop {
+        let rect = CGRect(x: (crop.minX * Double(picture.width)).rounded(), y: (crop.minY * Double(picture.height)).rounded(),
+                          width: max(1, (crop.width * Double(picture.width)).rounded()),
+                          height: max(1, (crop.height * Double(picture.height)).rounded()))
+        guard let cropped = picture.cropping(to: rect.intersection(CGRect(x: 0, y: 0, width: picture.width, height: picture.height)))
+        else { fail("comp-render: the crop falls outside the picture") }
+        picture = cropped
+    }
+    if let size, (size.0, size.1) != (picture.width, picture.height) {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: size.0, height: size.1, bitsPerComponent: 8, bytesPerRow: size.0 * 4,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { fail("comp-render: could not resize") }
+        context.interpolationQuality = .high
+        context.draw(picture, in: CGRect(x: 0, y: 0, width: size.0, height: size.1))
+        guard let resized = context.makeImage() else { fail("comp-render: could not resize") }
+        picture = resized
+    }
+    if let originalPath { write(picture, as: .png, to: URL(fileURLWithPath: originalPath)) }
+    var mapping = PresetMapping(preset, amount: amount, asShot: asShot.map { (temperature: $0.0, tint: $0.1) })
+    for (field, number) in overrides {
+        if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
+    }
+    let graded: CGImage
+    do { graded = try mapping.settings.apply(picture, scale: 1, seed: seed) }
+    catch { fail("comp-render: the grade is out of range after overrides (\(error.localizedDescription))") }
+    write(graded, as: .png, to: URL(fileURLWithPath: positional[2]))
+    struct Developed: Encodable {
+        let preset: String, width: Int, height: Int, asShot: [Double]?, whiteBalance: PresetMapping.WhiteBalance?
+        let notes: [String], skipped: [String], localCorrections: Int
+    }
+    printJSON(Developed(preset: preset.name, width: graded.width, height: graded.height, asShot: asShot.map { [$0.0, $0.1] },
+                        whiteBalance: mapping.whiteBalance, notes: mapping.notes, skipped: mapping.skipped,
+                        localCorrections: preset.corrections.filter(\.active).count))
+
+case "subject":
+    guard arguments.count == 1 else { fail(usage) }
+    // Vision analyzes at sizes far below a camera's, and boxes come back as fractions, so a copy fits.
+    let picture = loadPicture(arguments[0], maxSide: 1536)
+    struct Box: Encodable {
+        let x, y, width, height: Double
+        var confidence: Double? = nil
+        var coverage: Double? = nil
+    }
+    // Vision's rectangles are normalized with the origin at the bottom left; these count from the top left.
+    func box(_ rect: CGRect, confidence: Float? = nil) -> Box {
+        Box(x: rect.minX, y: 1 - rect.maxY, width: rect.width, height: rect.height, confidence: confidence.map(Double.init))
+    }
+    let handler = VNImageRequestHandler(cgImage: picture, orientation: .up)
+    // Each runs on its own, so one that isn't available on this Mac leaves the others' answers.
+    let faceRequest = VNDetectFaceRectanglesRequest()
+    try? handler.perform([faceRequest])
+    let peopleRequest = VNDetectHumanRectanglesRequest()
+    peopleRequest.upperBodyOnly = false
+    try? handler.perform([peopleRequest])
+    let attentionRequest = VNGenerateAttentionBasedSaliencyImageRequest()
+    try? handler.perform([attentionRequest])
+    let foregroundRequest = VNGenerateForegroundInstanceMaskRequest()
+    try? handler.perform([foregroundRequest])
+
+    // The foreground's bounds, from the instance mask at the model's own resolution (rows run top to bottom).
+    var subject: Box?
+    if let observation = foregroundRequest.results?.first, !observation.allInstances.isEmpty,
+       let mask = try? observation.generateMask(forInstances: observation.allInstances) {
+        CVPixelBufferLockBaseAddress(mask, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(mask, .readOnly) }
+        let width = CVPixelBufferGetWidth(mask), height = CVPixelBufferGetHeight(mask)
+        let rowBytes = CVPixelBufferGetBytesPerRow(mask)
+        if CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float,
+           let base = CVPixelBufferGetBaseAddress(mask) {
+            var minX = width, minY = height, maxX = -1, maxY = -1, covered = 0
+            for row in 0..<height {
+                let values = (base + row * rowBytes).assumingMemoryBound(to: Float.self)
+                for column in 0..<width where values[column] > 0.5 {
+                    minX = min(minX, column); maxX = max(maxX, column)
+                    minY = min(minY, row); maxY = max(maxY, row)
+                    covered += 1
+                }
+            }
+            if maxX >= 0 {
+                subject = Box(x: Double(minX) / Double(width), y: Double(minY) / Double(height),
+                              width: Double(maxX - minX + 1) / Double(width), height: Double(maxY - minY + 1) / Double(height),
+                              coverage: Double(covered) / Double(width * height))
+            }
+        }
+    }
+    struct Analysis: Encodable {
+        let width: Int, height: Int
+        let faces: [Box], people: [Box], subject: Box?, salient: [Box]
+    }
+    // The picture's own size, not the analyzed copy's.
+    let full = CGImageSourceCreateWithURL(URL(fileURLWithPath: arguments[0]) as CFURL, nil)
+        .flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
+    let orientation = full?[kCGImagePropertyOrientation] as? Int ?? 1
+    let sides = (full?[kCGImagePropertyPixelWidth] as? Int ?? picture.width, full?[kCGImagePropertyPixelHeight] as? Int ?? picture.height)
+    let (width, height) = orientation >= 5 ? (sides.1, sides.0) : sides
+    printJSON(Analysis(
+        width: width, height: height,
+        faces: (faceRequest.results ?? []).map { box($0.boundingBox, confidence: $0.confidence) },
+        people: (peopleRequest.results ?? []).map { box($0.boundingBox, confidence: $0.confidence) },
+        subject: subject,
+        salient: (attentionRequest.results?.first?.salientObjects ?? []).map { box($0.boundingBox, confidence: $0.confidence) }))
 
 case "render":
     var positional: [String] = []
