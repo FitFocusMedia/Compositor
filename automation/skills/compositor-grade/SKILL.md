@@ -77,8 +77,13 @@ compkit grade shoot/*.CR3 --preset ~/Documents/Presets/"God Tones.xmp" --out gra
 `--amount 0.7` applies the preset at 70% (0–2). `--set exposure=0.2 --set clarity=10` overrides Camera Raw
 fields after the preset; `comp-render preset` lists the field names under `fields`. For RAW files the per-show
 settings the person syncs in Lightroom go to the RAW stage: `--set raw.temperature=4170 --set raw.tint=30
---set raw.exposure=-0.14 --set raw.highlights=-11`. `--match look.cube` adds the learned look, `--list
-picks.txt` grades a list (a cull's picks, see compositor-cull) and `--jobs 6` grades several at once. Point curves aren't
+--set raw.exposure=-0.14 --set raw.highlights=-11`; `raw.temperature=0` keeps the camera's own white balance
+instead of the preset's. For a whole show, settle these on the setup sheet instead (`compkit show setup`, see
+compositor-cull): the person approves them once and every grade of the show uses them. `--match look.cube` adds the learned look, `--list
+picks.txt` grades a list (a cull's picks, see compositor-cull) and `--jobs 6` grades several at once. A batch
+resumes: rerun it and projects already graded with the same source, preset, look, strength and settings are kept
+(a missing or stale JPEG is only rendered again); changed settings grade those photos again. A photo that fails is
+reported and the rest carry on. Point curves aren't
 overridable this way: use the Tune · Curves layer. `--max-side` caps the project size (default 2048) and only
 ever shrinks, so small photos stay at their own size.
 

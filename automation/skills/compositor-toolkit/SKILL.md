@@ -12,11 +12,17 @@ missing, the repo is normally `~/Documents/Claude Projects/Compositor`.
 <repo>/
 ├── Compositor/                 the app's Swift sources (upstream: robbietilton/Compositor)
 └── automation/
-    ├── comp-render/            main.swift (the CLI), Develop.swift (Lightroom presets, RAW stage, .cube looks),
-    │                           Cull.swift (probe/score/previews), SparkleStub.swift, build.sh
-    ├── compkit/                Python library (__init__.py), culling (cull.py) and CLI (__main__.py)
+    ├── comp-render/            main.swift (the CLI, incl. render/export JPEG size caps and metadata), Develop.swift
+    │                           (Lightroom presets, RAW stage, .cube looks, the parallel grade), Cull.swift
+    │                           (probe/score/previews), SparkleStub.swift, build.sh
+    ├── compkit/                Python library (__init__.py), culling (cull.py), shows (show.py: profiles, setup,
+    │                           grade/export batches, compare/learn), the hands-off show day (showday.py: cards,
+    │                           runner, launchd agents), the dashboard (dashboard.py + dashboard.html), crop
+    │                           suggestions (framing.py), progress and failure logs (runlog.py), CLI (__main__.py)
     ├── skills/                 compositor-design, -batch, -photo, -grade, -cull, -toolkit (linked into ~/.claude/skills)
-    ├── tests/test_compkit.py   every case checked with the app's own loader and renderer
+    ├── tests/                  test_compkit.py (projects, grading, crops) and test_show.py (the show pipeline), every
+    │                           case checked with the app's own loader and renderer
+    ├── SHOW-RUNBOOK.md         a show from the card to the delivery, in order, with times and review points
     ├── install.sh              build + venv + launchers + skill links
     ├── bin/ .venv/ .build/     local, git-ignored
     └── README.md
@@ -64,6 +70,12 @@ records it doesn't understand as they are.
 | App tests: `SliderSnapTests` fails under Xcode 27 | Known: fixed upstream in PR robbietilton/Compositor#210 (the test must draw its window first). |
 | A RAW develops wrongly or not at all | `comp-render probe file.ARW` shows what macOS reads; the RAW stage needs a camera macOS supports (CIRAWFilter). RAW-stage tests run only with `COMPKIT_TEST_RAW=/path/to/file.ARW` set. |
 | Grades drift from Lightroom after a new camera or preset | Learn a new look: `compkit learn-look EXPORTS RAWS -o new.cube` (needs exports with embedded develop settings). |
+| A show step stopped (Ctrl-C, crash, sleep) | Run the same command again: scores (cull/.cache), graded projects and exports are kept and skipped. |
+| A card was inserted but nothing happened | `compkit show watch` shows whether the agents are loaded; `~/Library/Logs/compkit-cards.log` has what the watcher did. A card with no show started is left alone (with a notification). macOS may need Python allowed to read removable volumes (Privacy & Security › Files and Folders). |
+| Dashboard won't load | `compkit dashboard` (or the launchd agent, log in `~/Library/Logs/compkit-dashboard.log`); port 8765 must be free. |
+| `failures.csv` in a show's logs/ | Files that failed (a damaged RAW, a card-copy error); the rest of the step finished. Check the file, then rerun the step. |
+| Full-res export too slow or memory tight | Each full-resolution job takes ~6 GB; `--jobs 2` is the default, 3 is fine with nothing else heavy open. `--size "Web 2048"` makes only the web set (fast). |
+| Parallel and one-core grades differ | `comp-render develop … --serial` runs the app's own one-core grade; `applyInParallel` in Develop.swift must mirror `CameraRawSettings.apply` (test_parallel_grading_matches_the_apps_own checks it). Upstream changes to `apply` need the same change there. |
 | A preset setting is ignored | `comp-render preset x.xmp` shows what's mapped and what's skipped. To map a new Lightroom key, add it to `PresetMapping` in `comp-render/Develop.swift` (field paths are in `CameraRawFields`), rebuild and add a case to the preset test. |
 
 App tests (only needed when touching app sources):

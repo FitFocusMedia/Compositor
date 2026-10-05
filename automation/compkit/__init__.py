@@ -35,7 +35,7 @@ from typing import Iterable
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
 
-__all__ = ["Project", "Layer", "CompError", "comp_render", "defaults", "subject_mask", "analyze", "auto_focus",
+__all__ = ["Project", "Layer", "CompError", "Stopped", "comp_render", "defaults", "subject_mask", "analyze", "auto_focus",
            "fit_image", "read_preset", "develop", "measure", "lightroom_exports", "learn_look", "cull", "write_results",
            "write_ratings", "BLEND_MODES"]
 
@@ -52,13 +52,27 @@ class CompError(Exception):
     pass
 
 
+class Stopped(CompError):
+    """comp-render was stopped from outside (Ctrl-C, a kill, the system short of memory), not by what it was
+    reading: a long run should stop and resume later, not count the file as bad."""
+
+
+def check_comp_render(result: subprocess.CompletedProcess, what: str) -> None:
+    """Raises Stopped when comp-render was interrupted or killed, CompError when it failed on its input."""
+    import signal
+    if result.returncode < 0 and -result.returncode in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL, signal.SIGHUP):
+        raise Stopped(f"comp-render was stopped ({signal.Signals(-result.returncode).name})")
+    if result.returncode != 0:
+        raise CompError(result.stderr.strip() or f"{what} failed")
+
+
 def comp_render(*args: str) -> str:
-    """Runs comp-render and returns its stdout; raises CompError with its message on failure."""
+    """Runs comp-render and returns its stdout; raises CompError with its message on failure (Stopped if it was
+    interrupted)."""
     if not COMP_RENDER.exists():
         raise CompError(f"{COMP_RENDER} is missing: run automation/comp-render/build.sh")
     result = subprocess.run([str(COMP_RENDER), *map(str, args)], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise CompError(result.stderr.strip() or f"comp-render {' '.join(map(str, args))} failed")
+    check_comp_render(result, f"comp-render {' '.join(map(str, args))}")
     return result.stdout
 
 
@@ -332,10 +346,11 @@ def read_preset(preset) -> dict:
 
 
 def develop(source, preset, output, *, original=None, crop=None, size=None, amount: float = 1.0, as_shot=None,
-            settings: dict | None = None, seed: int = 0, match=None) -> dict:
+            settings: dict | None = None, seed: int = 0, match=None, rotate: float = 0) -> dict:
     """Grades a picture with a preset through Compositor's Camera Raw engine (`comp-render develop`) and writes
     `output` (PNG). RAW files are decoded as shot first. `original` also writes the ungraded picture; `crop` is
-    (x, y, w, h) in fractions of the upright picture; `size` (w, h) resizes before grading; `amount` 0–2 scales
+    (x, y, w, h) in fractions of the upright picture (leveled first by `rotate` degrees, counterclockwise, trimmed to
+    fill); `size` (w, h) resizes before grading; `amount` 0–2 scales
     the preset; `settings` overrides Camera Raw fields afterwards ({"exposure": 0.2, "curve.shadows": 5}, and for RAW
     files "raw.exposure", "raw.temperature", …); `match` finishes with a .cube look, e.g. one learn_look fitted.
     Returns the report: preset name, as-shot white balance used, notes and what was skipped."""
@@ -347,6 +362,8 @@ def develop(source, preset, output, *, original=None, crop=None, size=None, amou
         args = ["develop", Path(source).expanduser(), Path(preset).expanduser(), Path(output).expanduser()]
         if original:
             args += ["--original", Path(original).expanduser()]
+        if rotate:
+            args += ["--rotate", f"{float(rotate):g}"]
         if crop:
             args += ["--crop", ",".join(f"{float(v):.6f}" for v in crop)]
         if size:
@@ -837,6 +854,7 @@ class Layer:
             out = Path(folder) / "graded.png"
             if source and Path(source).exists():
                 report = develop(source, preset, out, crop=entry.get("crop"), size=entry.get("size"), amount=amount,
+                                 rotate=entry.get("rotate", 0),
                                  settings=settings, match=match)
             else:
                 if source:
@@ -1264,7 +1282,7 @@ class Project:
                          width: float | None = None, height: float | None = None, fit: str = "cover", focus="auto",
                          max_scale: float | None = 2.0, amount: float = 1.0, settings: dict | None = None,
                          local: bool = True, tune: bool = True, parent: Layer | None = None,
-                         above: Layer | None = None, match=None) -> Layer:
+                         above: Layer | None = None, match=None, crop=None, rotate: float = 0) -> Layer:
         """A photo with a Lightroom / Camera Raw preset (.xmp) applied as its base grade, kept adjustable. Makes a
         folder `name` holding, bottom to top:
           `<name> · Original`        the photo, ungraded and hidden (kept to grade again from)
@@ -1273,11 +1291,13 @@ class Project:
           `Tune · Exposure/Curves/Hue/Saturation/Color Balance`  neutral adjustment layers to fine-tune with
         The folder keeps the grade and tuning to this photo. Placement and cropping work as in add_image
         (cover or contain); `amount` 0–2 scales the preset; `settings` overrides Camera Raw fields; `match` finishes
-        with a .cube look (learn_look). A RAW source is graded at the RAW stage and remembered, so regrade() goes back
-        to it."""
+        with a .cube look (learn_look). `rotate` levels the photo first (degrees counterclockwise, trimmed to fill) and
+        `crop` (x, y, w, h fractions of the leveled photo) takes that part of it instead of cropping automatically. A
+        RAW source is graded at the RAW stage and remembered, so regrade() goes back to it."""
         group = self.add_group(name, parent=parent, above=above)
         self._grade_into(group, source, preset, x=x, y=y, width=width, height=height, fit=fit, focus=focus,
-                         max_scale=max_scale, amount=amount, settings=settings, local=local, tune=tune, match=match)
+                         max_scale=max_scale, amount=amount, settings=settings, local=local, tune=tune, match=match,
+                         crop=crop, rotate=rotate)
         return group
 
     def grade_layer(self, layer: Layer, preset, source=None, *, focus="auto", amount: float = 1.0,
@@ -1311,13 +1331,19 @@ class Project:
         return group
 
     def _grade_into(self, group: Layer, source, preset, *, x=None, y=None, width=None, height=None, fit="cover",
-                    focus="auto", max_scale=2.0, amount=1.0, settings=None, local=True, tune=True, match=None) -> dict:
+                    focus="auto", max_scale=2.0, amount=1.0, settings=None, local=True, tune=True, match=None,
+                    crop=None, rotate: float = 0) -> dict:
         parts = group.graded_parts()
         found = _analysis_for(source)
         if found.get("width"):
             size = (found["width"], found["height"])
         else:
             size = load_image(source).size
+        if rotate:
+            from .framing import inscribed_scale
+            keep = inscribed_scale(size[0], size[1], rotate)
+            size = (int(size[0] * keep), int(size[1] * keep))
+        given = crop
         if parts:  # a new picture for an existing graded photo: same box
             t = parts["original"].transform
             bx, by, bw, bh = t["origin"][0], t["origin"][1], t["size"][0], t["size"][1]
@@ -1326,7 +1352,11 @@ class Project:
             bh = height if height is not None else (self.height if width is None else size[1] * width / size[0])
             bx, by = x or 0, y or 0
         w, h = size
-        if fit == "cover":
+        if given:
+            crop = tuple(float(v) for v in given)
+            cw, ch = crop[2] * w, crop[3] * h
+            placement = (bx, by, bw, bh)
+        elif fit == "cover":
             if focus == "auto":
                 focus = auto_focus(found, size, (bw, bh)) if found else (0.5, 0.5)
             left, top, cw, ch = cover_crop(size, (bw, bh), focus)
@@ -1348,7 +1378,7 @@ class Project:
         with tempfile.TemporaryDirectory() as folder:
             original_png, graded_png = Path(folder) / "original.png", Path(folder) / "graded.png"
             report = develop(source, preset, graded_png, original=original_png, crop=crop, size=stored,
-                             amount=amount, settings=settings, match=match)
+                             amount=amount, settings=settings, match=match, rotate=rotate)
             original_pixels, graded_pixels = Image.open(original_png), Image.open(graded_png)
             original_pixels.load(); graded_pixels.load()
         as_shot = report.get("asShot")
@@ -1361,7 +1391,8 @@ class Project:
             self._sources[group.id] = {"source": str(Path(source).expanduser().resolve()), "crop": list(crop) if crop else None,
                                        "size": list(stored), "preset": str(Path(preset).expanduser().resolve()),
                                        "amount": amount, "settings": settings or {},
-                                       "match": str(Path(match).expanduser().resolve()) if match else None}
+                                       "match": str(Path(match).expanduser().resolve()) if match else None,
+                                       "rotate": float(rotate), "framed": bool(given)}
         box = transform(*placement)
         if parts:
             parts["original"].name = original_name

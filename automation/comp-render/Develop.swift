@@ -538,13 +538,16 @@ struct RawDeveloper {
         upright = image.extent.size
     }
 
-    /// `stage` nil develops the picture as shot (the kept original). `crop` is in fractions of the upright picture
-    /// from its top-left; `size` the exact pixel size wanted.
-    func render(_ stage: RawStage?, crop: CGRect?, size: (Int, Int)?) throws -> CGImage {
+    /// `stage` nil develops the picture as shot (the kept original). `rotate` levels it first (degrees,
+    /// counterclockwise; see `Straighten`). `crop` is in fractions of the upright (and leveled) picture from its
+    /// top-left; `size` the exact pixel size wanted.
+    func render(_ stage: RawStage?, crop: CGRect?, size: (Int, Int)?, rotate: Double = 0) throws -> CGImage {
         let frame = crop ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        let kept = Straighten.scale(width: upright.width, height: upright.height, degrees: rotate)
         var scale = 1.0
         if let size {
-            scale = min(1, max(Double(size.0) / (frame.width * upright.width), Double(size.1) / (frame.height * upright.height)) * 1.05)
+            scale = min(1, max(Double(size.0) / (frame.width * upright.width * kept),
+                               Double(size.1) / (frame.height * upright.height * kept)) * 1.05)
         }
         filter.scaleFactor = Float(scale)
         filter.isDraftModeEnabled = false
@@ -557,7 +560,8 @@ struct RawDeveloper {
         filter.neutralTemperature = Float(stage?.temperature ?? asShot.temperature)
         filter.neutralTint = Float(stage?.tint.map { $0 * tuning.tintScale } ?? asShot.tint)
         filter.exposure = Float(stage?.exposure ?? 0)
-        guard let image = filter.outputImage else { throw ImageImportError.unreadable }
+        guard var image = filter.outputImage else { throw ImageImportError.unreadable }
+        if rotate != 0 { image = Straighten.apply(image, degrees: rotate) }
         // Fractions from the top-left onto Core Image's bottom-left extent.
         let extent = image.extent
         var rect = CGRect(x: extent.minX + frame.minX * extent.width,
@@ -578,39 +582,15 @@ struct RawDeveloper {
         var bytes = [UInt8](repeating: 255, count: width * height * 4)
         let highlights = Float(stage?.highlights ?? 0) / 100, whites = Float(stage?.whites ?? 0) / 100
         // Above this, light the RAW still holds beyond white rolls off into range instead of clipping.
-        let knee = 1 - Float(tuning.shoulder) * max(0, -highlights) * 0.3 - (stage != nil && tuning.headroom > 0 ? 0.1 : 0)
-        let lift = 0.25 * max(0, highlights), white = 1 + 0.15 * whites
-        let pull = Float(tuning.highlightStrength) * max(0, -highlights)
-        func encode(_ v: Float) -> Float { v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055 }
-        func decode(_ v: Float) -> Float { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
-        let shapes = stage != nil
-        for index in stride(from: 0, to: linear.count, by: 4) {
-            var r = max(0, linear[index]), g = max(0, linear[index + 1]), b = max(0, linear[index + 2])
-            if shapes {
-                // On the brightest channel, so a colored light keeps its hue as it's brought into range.
-                let peak = max(r, g, b)
-                if peak > 0 {
-                    var v = encode(peak) * white
-                    // Lightroom's Highlights works on the upper half of the tones, most from light midtones up.
-                    if pull > 0 {
-                        let t = min(1, max(0, (v - 0.12) / 0.7))
-                        v *= 1 - pull * t * t * (3 - 2 * t)
-                    }
-                    if v > knee {
-                        let room = max(0.0001, 1 - knee)
-                        v = knee + room * (1 - exp(-(v - knee) / room))
-                    }
-                    if lift > 0 {
-                        let t = min(1, max(0, (v - 0.5) / 0.5))
-                        v += lift * t * t * (3 - 2 * t) * (1 - v)
-                    }
-                    let factor = decode(min(1, v)) / peak
-                    r *= factor; g *= factor; b *= factor
-                }
+        let shape = RawShape(
+            shapes: stage != nil,
+            knee: 1 - Float(tuning.shoulder) * max(0, -highlights) * 0.3 - (stage != nil && tuning.headroom > 0 ? 0.1 : 0),
+            lift: 0.25 * max(0, highlights), white: 1 + 0.15 * whites,
+            pull: Float(tuning.highlightStrength) * max(0, -highlights))
+        linear.withUnsafeBufferPointer { source in
+            bytes.withUnsafeMutableBufferPointer { target in
+                shape.run(source.baseAddress!, into: target.baseAddress!, pixels: width * height)
             }
-            bytes[index] = UInt8(min(255, max(0, encode(r) * 255 + 0.5)))
-            bytes[index + 1] = UInt8(min(255, max(0, encode(g) * 255 + 0.5)))
-            bytes[index + 2] = UInt8(min(255, max(0, encode(b) * 255 + 0.5)))
         }
         guard let provider = CGDataProvider(data: Data(bytes) as CFData),
               let result = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
@@ -619,6 +599,159 @@ struct RawDeveloper {
                                    provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
         else { throw ExportError.render }
         return result
+    }
+}
+
+/// Leveling a picture: turned about its center by `degrees` (counterclockwise as seen), then trimmed to the largest
+/// centered rectangle of its own shape that the turned picture still fills, so no corner is empty.
+nonisolated enum Straighten {
+    /// The share of the picture's width (and height) that stays.
+    static func scale(width: Double, height: Double, degrees: Double) -> Double {
+        guard degrees != 0, width > 0, height > 0 else { return 1 }
+        let angle = abs(degrees) * .pi / 180, c = cos(angle), s = sin(angle)
+        return min(width / (width * c + height * s), height / (width * s + height * c))
+    }
+
+    static func apply(_ image: CIImage, degrees: Double) -> CIImage {
+        let extent = image.extent
+        let center = CGPoint(x: extent.midX, y: extent.midY)
+        let turned = image.transformed(by: CGAffineTransform(translationX: center.x, y: center.y)
+            .rotated(by: degrees * .pi / 180).translatedBy(x: -center.x, y: -center.y))
+        let keep = scale(width: extent.width, height: extent.height, degrees: degrees)
+        let rect = CGRect(x: center.x - extent.width * keep / 2, y: center.y - extent.height * keep / 2,
+                          width: extent.width * keep, height: extent.height * keep).integral
+        return turned.cropped(to: rect).transformed(by: CGAffineTransform(translationX: -rect.minX, y: -rect.minY))
+    }
+
+    /// For an 8-bit picture (JPEG, HEIC …), the same through Core Image.
+    static func apply(_ picture: CGImage, degrees: Double) throws -> CGImage {
+        guard degrees != 0 else { return picture }
+        let leveled = apply(CIImage(cgImage: picture), degrees: degrees)
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let result = CIContext(options: [.workingColorSpace: space]).createCGImage(leveled, from: leveled.extent,
+                                                                                        format: .RGBA8, colorSpace: space)
+        else { throw ExportError.render }
+        return result
+    }
+}
+
+/// The RAW stage's tone shaping from linear light to 8-bit sRGB: highlights, whites and the roll-off of what lies
+/// above white. Each pixel depends on nothing but itself, so it runs in bands on every core.
+nonisolated struct RawShape: Sendable {
+    let shapes: Bool
+    let knee: Float, lift: Float, white: Float, pull: Float
+
+    static func encode(_ v: Float) -> Float { v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055 }
+    static func decode(_ v: Float) -> Float { v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+
+    func run(_ linear: UnsafePointer<Float>, into bytes: UnsafeMutablePointer<UInt8>, pixels: Int) {
+        let bands = max(1, min(pixels / 65_536, ProcessInfo.processInfo.activeProcessorCount * 4))
+        let share = (pixels + bands - 1) / bands
+        let source = UnsafeSendable(linear), target = UnsafeSendable(bytes)
+        DispatchQueue.concurrentPerform(iterations: bands) { band in
+            for pixel in band * share..<min(pixels, (band + 1) * share) { shape(source.pointer, target.pointer, pixel * 4) }
+        }
+    }
+
+    private func shape(_ linear: UnsafePointer<Float>, _ bytes: UnsafeMutablePointer<UInt8>, _ index: Int) {
+        var r = max(0, linear[index]), g = max(0, linear[index + 1]), b = max(0, linear[index + 2])
+        if shapes {
+            // On the brightest channel, so a colored light keeps its hue as it's brought into range.
+            let peak = max(r, g, b)
+            if peak > 0 {
+                var v = Self.encode(peak) * white
+                // Lightroom's Highlights works on the upper half of the tones, most from light midtones up.
+                if pull > 0 {
+                    let t = min(1, max(0, (v - 0.12) / 0.7))
+                    v *= 1 - pull * t * t * (3 - 2 * t)
+                }
+                if v > knee {
+                    let room = max(0.0001, 1 - knee)
+                    v = knee + room * (1 - exp(-(v - knee) / room))
+                }
+                if lift > 0 {
+                    let t = min(1, max(0, (v - 0.5) / 0.5))
+                    v += lift * t * t * (3 - 2 * t) * (1 - v)
+                }
+                let factor = Self.decode(min(1, v)) / peak
+                r *= factor; g *= factor; b *= factor
+            }
+        }
+        bytes[index] = UInt8(min(255, max(0, Self.encode(r) * 255 + 0.5)))
+        bytes[index + 1] = UInt8(min(255, max(0, Self.encode(g) * 255 + 0.5)))
+        bytes[index + 2] = UInt8(min(255, max(0, Self.encode(b) * 255 + 0.5)))
+    }
+}
+
+/// A pointer handed to the threads of `concurrentPerform`, each of which writes only its own rows.
+nonisolated struct UnsafeSendable<Pointer>: @unchecked Sendable {
+    let pointer: Pointer
+    init(_ pointer: Pointer) { self.pointer = pointer }
+}
+
+/// Runs a pointwise pixel kernel on horizontal bands on every core: only for kernels whose result at a pixel depends
+/// on that pixel alone, so the output is byte for byte what one pass over the whole image makes.
+nonisolated func inBands(_ pixels: UnsafeMutablePointer<UInt8>, height: Int, stride: Int,
+                         _ body: @Sendable (UnsafeMutablePointer<UInt8>, Int) -> Void) {
+    let bands = max(1, min(height / 16, ProcessInfo.processInfo.activeProcessorCount * 4))
+    let rows = (height + bands - 1) / bands
+    let base = UnsafeSendable(pixels)
+    DispatchQueue.concurrentPerform(iterations: bands) { band in
+        let first = band * rows
+        if first < height { body(base.pointer + first * stride, min(rows, height - first)) }
+    }
+}
+
+nonisolated extension CameraRawSettings {
+    /// `apply` for a finished grade (no clipping overlay, point-color view or sharpen mask) with its pointwise stages
+    /// (calibration, light and color, curve and color mixing) run in bands on every core. The stages that read
+    /// neighbors or position (effects, grain, detail, optics, geometry) run exactly as the app runs them. The result is
+    /// identical to `apply`'s; `comp-render develop --serial` runs the app's own to check that.
+    func applyInParallel(_ image: CGImage, seed: UInt32 = 0) throws -> CGImage {
+        let settings = normalized
+        if settings.isIdentity { return image }
+        guard settings.isValid else { throw ProjectError.invalid }
+        let gains = settings.gains
+        var source = image
+        if settings.adjustsGeometry { source = try settings.geometry.apply(source) }
+        return try ImageAdjustmentPixels.run(source) { pixels, width, height, stride in
+            if settings.adjustsCalibration {
+                inBands(pixels, height: height, stride: stride) { band, rows in
+                    settings.applyCalibration(pixels: band, width: width, height: rows, stride: stride)
+                }
+            }
+            if settings.adjustsLight || settings.adjustsColor {
+                inBands(pixels, height: height, stride: stride) { band, rows in
+                    adjust_camera_raw(band, width, rows, stride, gains.red, gains.green, gains.blue,
+                                      settings.exposure, settings.contrast, settings.highlights, settings.shadows,
+                                      settings.whites, settings.blacks, settings.vibrance, settings.saturation, 0)
+                }
+            }
+            if settings.adjustsCurve || settings.adjustsMixer || settings.adjustsGrading {
+                inBands(pixels, height: height, stride: stride) { band, rows in
+                    settings.applyCurveColor(band, width: width, height: rows, stride: stride, visualize: -1)
+                }
+            }
+            if settings.adjustsEffects {
+                if settings.texture != 0 || settings.clarity != 0 || settings.dehaze != 0 || settings.glow != 0 || settings.vignetteAmount != 0 {
+                    adjust_camera_raw_effects(pixels, width, height, stride,
+                                              settings.texture, settings.clarity, settings.dehaze,
+                                              settings.glow, settings.glowStyle.kernelValue, settings.glowRange,
+                                              settings.glowSpread, settings.glowWarmth,
+                                              settings.vignetteAmount, settings.vignetteMidpoint, settings.vignetteRoundness,
+                                              settings.vignetteFeather, settings.vignetteHighlights, settings.vignetteStyle.kernelValue,
+                                              1)
+                }
+                if settings.grainAmount > 0 {
+                    adjust_grain(pixels, width, height, stride, settings.grainAmount, settings.grainKernelSize,
+                                 settings.grainRoughness, seed, 0, 0, 1)
+                }
+            }
+            if settings.adjustsDetail || settings.adjustsOptics {
+                settings.applyDetailOptics(pixels: pixels, width: width, height: height, stride: stride, scale: 1,
+                                           profileStrength: PixelFilter.lensStrength, sharpenMask: false)
+            }
+        }
     }
 }
 

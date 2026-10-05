@@ -7,7 +7,7 @@ templates designed by hand in Compositor can be turned into finished images by s
 | --- | --- |
 | `bin/comp-render` | The app's own project loader, typesetter and renderer as a command-line tool. Output matches File › Export exactly. Built from `../Compositor` by `comp-render/build.sh`. |
 | `compkit/` | Python library for writing `.comp` packages: image, fill, gradient, text, adjustment and folder layers, masks, effects, clipping, guides; safe live writes; template fill. |
-| `compkit` (`python -m compkit`) | Command line: `cull` (thousands of frames → picks), `grade` (Lightroom preset as a tunable base grade), `learn-look` (match your Lightroom exports), `info`, `fill`, `batch` (CSV → renders), `crop` (subject-aware crops), `analyze`, `measure`, `sheet`, `where`. |
+| `compkit` (`python -m compkit`) | Command line: `show` (a whole show: cull, setup, grade, export, compare), `cull` (thousands of frames → picks), `pick` (re-dial a cull), `grade` (Lightroom preset as a tunable base grade, resumable), `learn-look` (match your Lightroom exports), `info`, `fill`, `batch` (CSV → renders), `crop` (subject-aware crops), `analyze`, `measure`, `sheet`, `where`. |
 | `skills/` | Claude Code skills: `compositor-design`, `-batch`, `-photo`, `-grade`, `-cull`, `-toolkit`. |
 | `install.sh` | Builds comp-render, sets up `.venv`, puts `comp-render`, `compkit` and `compkit-python` in `~/.local/bin`, and links the skills into `~/.claude/skills`. |
 | `examples/` | `build_post_template.py` builds a 1080×1350 post template; `batch/rows.csv` fills it. |
@@ -37,27 +37,103 @@ comp-render subject shot.heic       # Vision's faces, people, subject and salien
 comp-render fonts futura            # installed fonts' PostScript names (what a text style takes)
 comp-render preset base.xmp         # how a Lightroom preset maps onto Compositor's Camera Raw (and what doesn't)
 comp-render develop shot.CR3 base.xmp graded.png --original orig.png [--amount 0.8] [--set exposure=0.2]
+comp-render render post.comp post.jpg --max-bytes 2048000 --metadata-from shot.ARW   # size-capped, camera metadata
+comp-render export job.json         # a graded project to delivery JPEGs, re-developed at full resolution
 ```
 
 ## Shows: from thousands of RAWs to delivered images
 
+A show is a folder that the steps fill in turn. `SHOW-RUNBOOK.md` walks through a real show in order, with times
+and the points where you review and approve.
+
 ```sh
-compkit cull "/Volumes/Card/DCIM" --out show/cull [--keep 300] [--per-moment 2] [--ratings]
-compkit grade --list show/cull/picks.txt --preset base.xmp --match look.cube \
-  --set raw.temperature=4170 --set raw.exposure=-0.14 --out show/graded --render --jobs 6
+compkit show new SHOW --card /path/to/card-copy --profile competition --name "Spring Classic"
+compkit show cull SHOW                       # picks by the profile's keep rate; contact sheets in SHOW/cull/sheets
+compkit show pick SHOW --rate 35%            # re-dial from the same scores, in seconds (or --count 1000)
+compkit show setup SHOW                      # white balance / exposure candidates on one sheet …
+compkit show setup SHOW --approve B          # … approved for the show (or 1=B,2=C,… per lighting)
+compkit show grade SHOW                      # tunable projects + 2048 px JPEGs, with the approved settings
+compkit show export SHOW                     # the delivery spec: sizes, names, folders, file-size cap
+compkit show compare SHOW --delivered EXPORTS [--learn]   # against what you delivered; --learn updates the profile
+compkit show status SHOW
 ```
 
-`cull` reads each frame's embedded preview (RAWs aren't decoded), which takes about 15 s per 1,000 frames:
-- `comp-render probe` reads metadata and `comp-render score` measures, on every core: Apple's aesthetic score,
-  face capture quality and eye openness, sharpness of the subject in focus, a peak-sharpness check for
-  missed focus, exposure, and the Vision feature-print distance to the previous frame.
+**A hands-off show day:**
+
+| Command | What it does |
+| --- | --- |
+| `compkit show start --drive /Volumes/X --name "…" --profile …` | Sets up the day's show on the show drive. |
+| `compkit show watch --install` | Installs two launchd agents: the card watcher and an always-on dashboard. |
+
+From then on every inserted card is copied, verified and run through every step on its own. Picks already made are
+never changed by later cards. The dashboard (`compkit dashboard`, http://localhost:8765, served from this Mac
+only) shows progress and every frame by moment. It also takes changes, which the runner then grades and delivers:
+- picks, alternates and rejects, set with the keyboard;
+- re-dials;
+- crops and leveling;
+- setup approval.
+
+Leveling happens at the RAW stage, before the 8-bit grade. Automatic crop suggestions (`compkit/framing.py`) exist
+but are off by default (`compkit show profiles --set NAME auto_crop=true`). On a real shoot they didn't match the
+photographer's own crops.
+
+- **Resumable:** every step can be stopped (Ctrl-C, a crash) and run again. Scores are cached, graded projects
+  whose settings haven't changed are kept, and exports newer than their project are skipped.
+- **Failures:** a file that fails goes to `SHOW/logs/failures.csv` and the step carries on. Each step logs its
+  progress to `SHOW/logs/<step>.log`.
+- **Read-only cards:** the card copy is only ever read.
+
+**Culling** reads each frame's embedded preview (RAWs aren't decoded):
+- `comp-render probe` reads metadata, and `comp-render score` measures on every core: Apple's aesthetic score,
+  face capture quality and eye openness, sharpness of the subject in focus, a peak-sharpness check for missed
+  focus, exposure, and the Vision feature print.
 - Frames group into moments: consecutive, within 2 s, alike.
 - Clear failures are rejected: nothing in focus, eyes shut, far off exposure.
-- The best frame of each moment is picked.
-- It writes `picks.txt`, `cull.csv`/`cull.json`, contact sheets, and optionally Lightroom star ratings as sidecars.
+- Picks follow a keep rate or count. Each moment gets frames in proportion to its size, so a long burst or a held
+  pose gets more than a single shot. Every moment's first frame comes before any moment's second.
+- It writes `picks.txt`, `cull.csv`/`cull.json`, contact sheets and, with `--ratings` only, Lightroom star ratings
+  as sidecars.
 
-Against a photographer's own 170 picks from a 429-frame shoot, it picked a frame in 124 of the 125 moments they
-used and wrongly rejected 1 keeper. Which frame of a burst to keep (expression, pose) stays their call.
+`compkit cull FOLDER --out cull/ [--profile …|--rate 40%|--count N|--per-moment K]` and `compkit pick cull/ --rate
+35%` do the same without a show folder.
+
+**Profiles** (`compkit show profiles`) are `workshop`, `competition` and `fight-night`. Each holds a keep rate,
+how frames group into moments, the per-moment rule (tau: how much a fast-burst frame counts, cover: the first frame
+of each moment first, beta: how far a better score moves a frame ahead), and the setup settings of the last show
+learned from. What they learn, your default preset and look, and your delivery spec live in `~/Documents/Presets/Show
+Profiles/` (`COMPKIT_PROFILES` overrides that), outside this repository. `compkit show defaults` sets the preset,
+look, naming, folders and file-size cap.
+
+Calibrated against a photographer's own 170 delivered frames from a 429-frame posed shoot:
+
+| | One pick per moment | Calibrated rule |
+| --- | --- | --- |
+| Picks | 165 | 170 |
+| Moments covered | 124/125 | 123/125 |
+| Keepers wrongly rejected | 1 | 1 |
+| Keepers picked | 71 | 76 |
+| Picks per moment, mean error | 0.52 | 0.44 |
+
+On held-out halves of the shoot the gain was smaller but held. Which frame within a moment it picks is no better
+than chance, so the alternates sit beside every pick.
+
+**Export** grades each full-resolution file again from its RAW: `comp-render export` re-develops the photo at
+61 MP and renders the whole project at that size (local corrections and Tune layers included). Each file is
+written as the highest JPEG quality under the size cap, as Lightroom's "Limit File Size To" does, with the camera's
+metadata. Smaller sizes come from the 2048 px project. On 1,202 picks from a 3,003-frame stand-in show (M2 Max):
+
+| Step | Time |
+| --- | --- |
+| Cull | about 1 minute |
+| Re-dial | 3 s |
+| Grade | 14 minutes |
+| Web 2048 export | 3.4 minutes |
+| Full-resolution export, 3 jobs | about 115 minutes (5.7 s each, about 6 GB of memory per job) |
+
+Files average 2.0 MB at full resolution and 0.8 MB at 2048 px.
+
+The grading engine's pointwise stages run in bands on every core. Their output is byte-identical to the app's
+one-core grade (`comp-render develop --serial`), which takes a 61 MP grade from 31 s to 15 s.
 
 ## Lightroom presets
 

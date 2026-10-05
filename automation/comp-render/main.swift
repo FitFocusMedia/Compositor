@@ -13,6 +13,13 @@ usage:
       --quality <0-1>        JPEG quality (default 0.9)
       --max-side <pixels>    scale down so the longer side fits (default: full size)
       --background <RRGGBB>  JPEG background behind transparency (default FFFFFF)
+      --max-bytes <bytes>    JPEG: the highest quality up to --quality whose file fits this size
+      --metadata-from <file> copy a source photo's camera metadata (EXIF, TIFF, GPS, IPTC) into the output
+  comp-render export <job.json>
+      a graded project to delivery JPEGs, from a job: {"project", "outputs": [{"path", "maxSide", "maxBytes",
+      "quality"}], "metadata": source photo, "develop": {"layer", "source", "preset", "crop", "amount", "settings",
+      "match"}}. With "develop" the layer's photo is graded again from its source at full resolution and the whole
+      project rendered at that size; prints what was written as JSON
   comp-render validate <project.comp>
       loads the project exactly as the app does; exit 0 if it would open, 1 with the reason if not
   comp-render info <project.comp>
@@ -38,16 +45,20 @@ usage:
       applies the preset with Compositor's Camera Raw engine. For RAW files, exposure, white balance (Kelvin, exactly),
       highlights, whites and lens corrections are applied while decoding, in floating point, before the 8-bit grade
       --original <out.png>      also write the picture as decoded, cropped and sized but ungraded
-      --crop <x,y,w,h>          crop first, in fractions of the upright picture (0–1)
+      --rotate <degrees>        level the picture first: turned counterclockwise and trimmed to fill (-45 to 45)
+      --crop <x,y,w,h>          crop first, in fractions of the upright (and leveled) picture (0–1)
       --size <WxH>              then resize to exactly this many pixels
       --amount <0-2>            preset strength (default 1)
       --as-shot <kelvin,tint>   the picture's own white balance, when it's known (RAW files report theirs)
       --set <field=value>       override a Camera Raw field after the preset (repeatable), e.g. exposure=0.3,
                                 clarity=10, curve.shadows=5, mixer.saturation.orange=-10 (see `preset` output);
                                 for RAW files also raw.exposure, raw.temperature, raw.tint, raw.highlights, raw.whites
+                                (raw.temperature=0: the camera's own white balance instead of the preset's)
       --match <look.cube>       finish with a color lookup table, e.g. one `compkit learn-look` fitted to your own
                                 Lightroom exports so the grade matches Lightroom's rendering
       --seed <n>                grain pattern (default 0)
+      --serial                  grade on one core with the app's own code (the default runs it on every core,
+                                with identical results)
       prints JSON: the as-shot white balance used, notes and what was skipped
   comp-render probe <file>... | --list <paths.txt>
       each frame's metadata as JSON, without decoding it: upright size, orientation, capture time, ISO, shutter,
@@ -119,6 +130,111 @@ let rawFields: Set<String> = ["raw.exposure", "raw.temperature", "raw.tint", "ra
 func loadPreset(_ path: String) -> LightroomPreset {
     do { return try LightroomPreset(url: URL(fileURLWithPath: path)) }
     catch { fail("comp-render: \(path): not a Lightroom / Camera Raw preset (.xmp) this can read") }
+}
+
+/// `--set` overrides on top of a preset's mapping: Camera Raw fields of the 8-bit grade and, for RAW files, the RAW
+/// stage's (raw.exposure, raw.temperature, raw.tint, raw.highlights, raw.whites).
+func applyOverrides(_ overrides: [(String, Double)], to mapping: inout PresetMapping) {
+    // raw.temperature=0 means the camera's own white balance (temperature and tint), in place of the preset's;
+    // a raw.tint given with it still applies.
+    if overrides.contains(where: { $0.0 == "raw.temperature" && $0.1 <= 0 }) {
+        mapping.raw?.temperature = nil
+        mapping.raw?.tint = nil
+    }
+    for (field, number) in overrides {
+        if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
+        switch field {
+        case "raw.exposure": mapping.raw?.exposure = number
+        case "raw.temperature" where number > 0: mapping.raw?.temperature = number
+        case "raw.tint": mapping.raw?.tint = number
+        case "raw.highlights": mapping.raw?.highlights = number
+        case "raw.whites": mapping.raw?.whites = number
+        default: break
+        }
+    }
+}
+
+/// The picture scaled down (never up) so its longer side fits `maxSide`, and for JPEG flattened onto `background`,
+/// as the app's JPEG export does.
+func flattened(_ source: CGImage, maxSide: Int?, opaque: Bool, background: (red: Double, green: Double, blue: Double)) -> CGImage {
+    let scale = maxSide.map { min(1, Double($0) / Double(max(source.width, source.height))) } ?? 1
+    let width = max(1, Int((Double(source.width) * scale).rounded())), height = max(1, Int((Double(source.height) * scale).rounded()))
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: space,
+                                  bitmapInfo: (opaque ? CGImageAlphaInfo.noneSkipLast : .premultipliedLast).rawValue) else {
+        fail("comp-render: the image could not be rendered")
+    }
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+    if opaque {
+        context.setFillColor(red: background.red, green: background.green, blue: background.blue, alpha: 1)
+        context.fill(bounds)
+    }
+    context.interpolationQuality = .high
+    context.draw(source, in: bounds)
+    guard let image = context.makeImage() else { fail("comp-render: the image could not be rendered") }
+    return image
+}
+
+/// A JPEG of `image` at `quality`, or with `maxBytes` the highest quality up to `quality` whose file fits, found by
+/// halving the range as Lightroom's "Limit File Size To" does. Returns the bytes and the quality used.
+func jpeg(_ image: CGImage, quality: Double, maxBytes: Int?, properties: [CFString: Any]) -> (data: Data, quality: Double) {
+    func encode(_ quality: Double) -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { fail("comp-render: could not encode") }
+        var options = properties
+        options[kCGImageDestinationLossyCompressionQuality] = min(1, max(0, quality))
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { fail("comp-render: could not encode") }
+        return data as Data
+    }
+    let first = encode(quality)
+    guard let maxBytes, first.count > maxBytes else { return (first, quality) }
+    var low = 0.0, high = quality, best: (data: Data, quality: Double)?
+    for _ in 0..<7 {
+        let middle = (low + high) / 2
+        let data = encode(middle)
+        if data.count <= maxBytes { best = (data, middle); low = middle } else { high = middle }
+    }
+    return best ?? (encode(0), 0)
+}
+
+/// The camera's metadata from a source picture (EXIF, TIFF, GPS, IPTC), for a delivered JPEG: upright, so its
+/// orientation is 1, and without the source's own pixel size.
+func deliveredMetadata(from path: String) -> [CFString: Any] {
+    guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else { return [:] }
+    var result: [CFString: Any] = [kCGImagePropertyOrientation: 1]
+    for key in [kCGImagePropertyExifDictionary, kCGImagePropertyExifAuxDictionary, kCGImagePropertyTIFFDictionary,
+                kCGImagePropertyGPSDictionary, kCGImagePropertyIPTCDictionary] {
+        guard var dictionary = properties[key] as? [CFString: Any] else { continue }
+        for drop in [kCGImagePropertyExifPixelXDimension, kCGImagePropertyExifPixelYDimension, kCGImagePropertyExifMakerNote,
+                     kCGImagePropertyTIFFXResolution, kCGImagePropertyTIFFYResolution, kCGImagePropertyTIFFResolutionUnit] {
+            dictionary.removeValue(forKey: drop)
+        }
+        if key == kCGImagePropertyTIFFDictionary { dictionary[kCGImagePropertyTIFFOrientation] = 1 }
+        result[key] = dictionary
+    }
+    return result
+}
+
+/// A copy of `manifest` scaled by `sx`, `sy`: the canvas and every layer's placement. Masks and adjustments follow
+/// their layers, so the project renders as it did, at the new size.
+func scaled(_ manifest: ProjectManifest, x sx: Double, y sy: Double) throws -> ProjectManifest {
+    guard var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(manifest)) as? [String: Any],
+          let layers = object["layers"] as? [[String: Any]] else { throw ProjectError.invalid }
+    object["width"] = max(1, Int((Double(manifest.width) * sx).rounded()))
+    object["height"] = max(1, Int((Double(manifest.height) * sy).rounded()))
+    object["layers"] = layers.map { record -> [String: Any] in
+        var record = record
+        if var t = record["transform"] as? [String: Any], let origin = t["origin"] as? [Double], let size = t["size"] as? [Double],
+           origin.count == 2, size.count == 2 {
+            t["origin"] = [origin[0] * sx, origin[1] * sy]
+            t["size"] = [size[0] * sx, size[1] * sy]
+            record["transform"] = t
+        }
+        return record
+    }
+    return try JSONDecoder().decode(ProjectManifest.self, from: JSONSerialization.data(withJSONObject: object))
 }
 
 var arguments = Array(CommandLine.arguments.dropFirst())
@@ -288,6 +404,7 @@ case "develop":
     var positional: [String] = []
     var originalPath: String?, crop: CGRect?, size: (Int, Int)?, amount = 1.0, givenAsShot: (Double, Double)?
     var overrides: [(String, Double)] = [], seed: UInt32 = 0, tuning = RawDeveloper.Tuning(), match: ColorCube?
+    var serial = false, rotate = 0.0
     while !arguments.isEmpty {
         let argument = arguments.removeFirst()
         func value() -> String {
@@ -334,6 +451,11 @@ case "develop":
         case "--seed":
             guard let number = UInt32(value()) else { fail("--seed takes a whole number") }
             seed = number
+        // The app's own one-core grade, to check the parallel one against.
+        case "--serial": serial = true
+        case "--rotate":
+            guard let number = Double(value()), (-45...45).contains(number) else { fail("--rotate takes degrees, -45 to 45") }
+            rotate = number
         default: positional.append(argument)
         }
     }
@@ -345,21 +467,13 @@ case "develop":
         // in floating point; the rest of the grade runs on the 8-bit result.
         developer.tuning = tuning
         var mapping = PresetMapping(preset, amount: amount, asShot: developer.asShot, rawStage: true)
-        for (field, number) in overrides {
-            if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
-            switch field {
-            case "raw.exposure": mapping.raw?.exposure = number
-            case "raw.temperature": mapping.raw?.temperature = number
-            case "raw.tint": mapping.raw?.tint = number
-            case "raw.highlights": mapping.raw?.highlights = number
-            case "raw.whites": mapping.raw?.whites = number
-            default: break
-            }
-        }
+        applyOverrides(overrides, to: &mapping)
         let graded: CGImage
         do {
-            if let originalPath { write(try developer.render(nil, crop: crop, size: size), as: .png, to: URL(fileURLWithPath: originalPath)) }
-            let base = try mapping.settings.apply(try developer.render(mapping.raw ?? RawStage(), crop: crop, size: size), scale: 1, seed: seed)
+            if let originalPath { write(try developer.render(nil, crop: crop, size: size, rotate: rotate), as: .png, to: URL(fileURLWithPath: originalPath)) }
+            let developed = try developer.render(mapping.raw ?? RawStage(), crop: crop, size: size, rotate: rotate)
+            let base = serial ? try mapping.settings.apply(developed, scale: 1, seed: seed)
+                : try mapping.settings.applyInParallel(developed, seed: seed)
             graded = try match?.apply(base) ?? base
         } catch { fail("comp-render: \(pictureURL.path): \(error.localizedDescription)") }
         write(graded, as: .png, to: URL(fileURLWithPath: positional[2]))
@@ -378,6 +492,8 @@ case "develop":
     var picture: CGImage
     let asShot = givenAsShot
     picture = loadPicture(positional[0])
+    do { picture = try Straighten.apply(picture, degrees: rotate) }
+    catch { fail("comp-render: could not level the picture") }
     if let crop {
         let rect = CGRect(x: (crop.minX * Double(picture.width)).rounded(), y: (crop.minY * Double(picture.height)).rounded(),
                           width: max(1, (crop.width * Double(picture.width)).rounded()),
@@ -397,12 +513,10 @@ case "develop":
     }
     if let originalPath { write(picture, as: .png, to: URL(fileURLWithPath: originalPath)) }
     var mapping = PresetMapping(preset, amount: amount, asShot: asShot.map { (temperature: $0.0, tint: $0.1) })
-    for (field, number) in overrides {
-        if let path = CameraRawFields.paths[field] { mapping.settings[keyPath: path] = number }
-    }
+    applyOverrides(overrides, to: &mapping)
     let graded: CGImage
     do {
-        let base = try mapping.settings.apply(picture, scale: 1, seed: seed)
+        let base = serial ? try mapping.settings.apply(picture, scale: 1, seed: seed) : try mapping.settings.applyInParallel(picture, seed: seed)
         graded = try match?.apply(base) ?? base
     }
     catch { fail("comp-render: the grade is out of range after overrides (\(error.localizedDescription))") }
@@ -523,6 +637,8 @@ case "subject":
     try? handler.perform([attentionRequest])
     let foregroundRequest = VNGenerateForegroundInstanceMaskRequest()
     try? handler.perform([foregroundRequest])
+    let horizonRequest = VNDetectHorizonRequest()
+    try? handler.perform([horizonRequest])
 
     // The foreground's bounds, from the instance mask at the model's own resolution (rows run top to bottom).
     var subject: Box?
@@ -553,6 +669,9 @@ case "subject":
     struct Analysis: Encodable {
         let width: Int, height: Int
         let faces: [Box], people: [Box], subject: Box?, salient: [Box]
+        /// Vision's horizon, when it found one: the degrees (counterclockwise) that would level the picture, as
+        /// `develop --rotate` takes them.
+        let level: Double?
     }
     // The picture's own size, not the analyzed copy's.
     let full = CGImageSourceCreateWithURL(URL(fileURLWithPath: arguments[0]) as CFURL, nil)
@@ -565,11 +684,12 @@ case "subject":
         faces: (faceRequest.results ?? []).map { box($0.boundingBox, confidence: $0.confidence) },
         people: (peopleRequest.results ?? []).map { box($0.boundingBox, confidence: $0.confidence) },
         subject: subject,
-        salient: (attentionRequest.results?.first?.salientObjects ?? []).map { box($0.boundingBox, confidence: $0.confidence) }))
+        salient: (attentionRequest.results?.first?.salientObjects ?? []).map { box($0.boundingBox, confidence: $0.confidence) },
+        level: horizonRequest.results?.first.map { Double($0.angle) * 180 / .pi }))
 
 case "render":
     var positional: [String] = []
-    var quality = 0.9, maxSide: Int?, background = (red: 1.0, green: 1.0, blue: 1.0)
+    var quality = 0.9, maxSide: Int?, maxBytes: Int?, metadataSource: String?, background = (red: 1.0, green: 1.0, blue: 1.0)
     while !arguments.isEmpty {
         let argument = arguments.removeFirst()
         func value() -> String {
@@ -583,6 +703,10 @@ case "render":
         case "--max-side":
             guard let pixels = Int(value()), pixels > 0 else { fail("--max-side takes a whole number of pixels") }
             maxSide = pixels
+        case "--max-bytes":
+            guard let bytes = Int(value()), bytes > 1000 else { fail("--max-bytes takes a file size in bytes") }
+            maxBytes = bytes
+        case "--metadata-from": metadataSource = value()
         case "--background":
             let hex = value().trimmingCharacters(in: CharacterSet(charactersIn: "#"))
             guard hex.count == 6, let rgb = UInt32(hex, radix: 16) else { fail("--background takes a color like FFFFFF") }
@@ -602,29 +726,104 @@ case "render":
     let raster: ExportRaster
     do { raster = try await ImageExporter.shared.render(snapshot) }
     catch { fail("comp-render: \(error.localizedDescription)") }
+    let image = flattened(raster.image, maxSide: maxSide, opaque: type == .jpeg, background: background)
+    var properties: [CFString: Any] = metadataSource.map(deliveredMetadata) ?? [:]
+    properties[kCGImagePropertyDPIWidth] = raster.resolution
+    properties[kCGImagePropertyDPIHeight] = raster.resolution
+    if type == .jpeg {
+        do { try jpeg(image, quality: quality, maxBytes: maxBytes, properties: properties).data.write(to: outputURL, options: .atomic) }
+        catch { fail("comp-render: \(outputURL.path): \(error.localizedDescription)") }
+    } else {
+        write(image, as: type, to: outputURL, properties: properties)
+    }
+    print("\(outputURL.path) \(image.width)×\(image.height)")
 
-    // Scales down (never up), and for JPEG flattens onto the background color, as the app's JPEG export does.
-    let source = raster.image
-    let scale = maxSide.map { min(1, Double($0) / Double(max(source.width, source.height))) } ?? 1
-    let width = max(1, Int((Double(source.width) * scale).rounded())), height = max(1, Int((Double(source.height) * scale).rounded()))
-    let opaque = type == .jpeg
-    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-          let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: space,
-                                  bitmapInfo: (opaque ? CGImageAlphaInfo.noneSkipLast : .premultipliedLast).rawValue) else {
-        fail("comp-render: the image could not be rendered")
+case "export":
+    // A graded project to delivery JPEGs: with `develop`, its photo is graded again from the source at full
+    // resolution and the whole project (local corrections, Tune layers) rendered at that size.
+    guard arguments.count == 1 else { fail(usage) }
+    struct ExportJob: Decodable {
+        struct Develop: Decodable {
+            let layer: String, source: String, preset: String
+            var crop: [Double]?, amount: Double?, settings: [String: Double]?, match: String?, rotate: Double?
+        }
+        struct Output: Decodable {
+            let path: String
+            var maxSide: Int?, maxBytes: Int?, quality: Double?
+        }
+        let project: String
+        var develop: Develop?
+        var metadata: String?
+        let outputs: [Output]
     }
-    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
-    if opaque {
-        context.setFillColor(red: background.red, green: background.green, blue: background.blue, alpha: 1)
-        context.fill(bounds)
+    let jobURL = URL(fileURLWithPath: arguments[0])
+    let job: ExportJob
+    do { job = try JSONDecoder().decode(ExportJob.self, from: Data(contentsOf: jobURL)) }
+    catch { fail("comp-render: \(jobURL.path): not an export job (\(error))") }
+    var snapshot = await load(job.project)
+    if let request = job.develop {
+        guard let layerID = UUID(uuidString: request.layer),
+              let layer = snapshot.manifest.layers.first(where: { $0.id == layerID }), layer.imageFile != nil else {
+            fail("comp-render: \(job.project) has no picture layer \(request.layer)")
+        }
+        let preset = loadPreset(request.preset)
+        let match: ColorCube?
+        do { match = try request.match.map { try ColorCube(url: URL(fileURLWithPath: $0)) } }
+        catch { fail("comp-render: \(request.match ?? ""): not a .cube color lookup table this can read") }
+        let crop = request.crop.flatMap { $0.count == 4 ? CGRect(x: $0[0], y: $0[1], width: $0[2], height: $0[3]) : nil }
+        let overrides = (request.settings ?? [:]).sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+        let sourceURL = URL(fileURLWithPath: request.source)
+        let full: CGImage
+        do {
+            if RawImporter.matches(sourceURL), let developer = RawDeveloper(url: sourceURL) {
+                var mapping = PresetMapping(preset, amount: request.amount ?? 1, asShot: developer.asShot, rawStage: true)
+                applyOverrides(overrides, to: &mapping)
+                let base = try mapping.settings.applyInParallel(try developer.render(mapping.raw ?? RawStage(), crop: crop, size: nil,
+                                                                                     rotate: request.rotate ?? 0))
+                full = try match?.apply(base) ?? base
+            } else {
+                var picture = try Straighten.apply(loadPicture(request.source), degrees: request.rotate ?? 0)
+                if let crop {
+                    let rect = CGRect(x: (crop.minX * Double(picture.width)).rounded(), y: (crop.minY * Double(picture.height)).rounded(),
+                                      width: max(1, (crop.width * Double(picture.width)).rounded()),
+                                      height: max(1, (crop.height * Double(picture.height)).rounded()))
+                    guard let cropped = picture.cropping(to: rect.intersection(CGRect(x: 0, y: 0, width: picture.width, height: picture.height)))
+                    else { fail("comp-render: the crop falls outside the picture") }
+                    picture = cropped
+                }
+                var mapping = PresetMapping(preset, amount: request.amount ?? 1, asShot: nil)
+                applyOverrides(overrides, to: &mapping)
+                let base = try mapping.settings.applyInParallel(picture)
+                full = try match?.apply(base) ?? base
+            }
+            let box = layer.transform.size
+            snapshot = ProjectSnapshot(manifest: try scaled(snapshot.manifest, x: Double(full.width) / box.width, y: Double(full.height) / box.height),
+                                       images: snapshot.images.merging([layerID: ImportedImage(image: full, thumbnail: full, name: sourceURL.lastPathComponent)]) { $1 },
+                                       masks: snapshot.masks)
+        } catch { fail("comp-render: \(request.source): \(error.localizedDescription)") }
     }
-    context.interpolationQuality = .high
-    context.draw(source, in: bounds)
-    guard let image = context.makeImage() else { fail("comp-render: the image could not be rendered") }
-    var properties: [CFString: Any] = [kCGImagePropertyDPIWidth: raster.resolution, kCGImagePropertyDPIHeight: raster.resolution]
-    if opaque { properties[kCGImageDestinationLossyCompressionQuality] = min(1, max(0, quality)) }
-    write(image, as: type, to: outputURL, properties: properties)
-    print("\(outputURL.path) \(width)×\(height)")
+    let raster: ExportRaster
+    do { raster = try await ImageExporter.shared.render(snapshot) }
+    catch { fail("comp-render: \(error.localizedDescription)") }
+    // `fits` is false when even the lowest quality is over maxBytes (a very detailed or noisy frame at full size).
+    struct Written: Encodable { let path: String, width: Int, height: Int, bytes: Int, quality: Double, fits: Bool }
+    var written: [Written] = []
+    var properties: [CFString: Any] = job.metadata.map(deliveredMetadata) ?? [:]
+    properties[kCGImagePropertyDPIWidth] = raster.resolution
+    properties[kCGImagePropertyDPIHeight] = raster.resolution
+    for output in job.outputs {
+        let image = flattened(raster.image, maxSide: output.maxSide, opaque: true, background: (1, 1, 1))
+        let encoded = jpeg(image, quality: output.quality ?? 0.92, maxBytes: output.maxBytes, properties: properties)
+        let url = URL(fileURLWithPath: output.path)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try encoded.data.write(to: url, options: .atomic)
+        } catch { fail("comp-render: \(url.path): \(error.localizedDescription)") }
+        written.append(Written(path: url.path, width: image.width, height: image.height, bytes: encoded.data.count,
+                               quality: (encoded.quality * 1000).rounded() / 1000,
+                               fits: output.maxBytes.map { encoded.data.count <= $0 } ?? true))
+    }
+    printJSON(written)
 
 default:
     fail(usage)
