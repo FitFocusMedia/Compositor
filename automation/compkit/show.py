@@ -222,7 +222,7 @@ def cull_show(show: Show, *, rate: float | None = None, count: int | None = None
         dial = {"rate": rate}
     else:
         dial = next(({key: last[key]} for key in ("count", "rate", "per_moment") if last.get(key) is not None),
-                    {"rate": p["rate"]})
+                    {"per_moment": p["per_moment"]} if p.get("per_moment") else {"rate": p["rate"]})
     paths = gather(show.data["cards"])
     if not paths:
         raise CompError("no pictures on the show's cards yet")

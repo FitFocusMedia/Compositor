@@ -217,8 +217,9 @@ static double rec709(double r, double g, double b) {
     return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-// Moves r, g, b so their Rec. 709 luminance becomes `target`, keeping the hue. Pure black cannot
-// be scaled, so a lift paints neutral light of that luminance.
+// Moves r, g, b so their Rec. 709 luminance becomes `target`, keeping the hue. A lift needing more
+// than a 4× gain adds the rest as neutral light: scaling further would blow a near-black pixel's
+// noise or cast up into a full color (a 1/255 blue needs 500× to reach 0.15). Pure black takes it all.
 static void scale_luminance(double *r, double *g, double *b, double target) {
     target = camera_clamp(target);
     double y = rec709(*r, *g, *b);
@@ -227,10 +228,14 @@ static void scale_luminance(double *r, double *g, double *b, double target) {
         if (target > y) *r = *g = *b = target;
         return;
     }
-    double scale = target / y;
-    *r = camera_clamp(*r * scale);
-    *g = camera_clamp(*g * scale);
-    *b = camera_clamp(*b * scale);
+    double scale = target / y, neutral = 0;
+    if (scale > 4) {
+        scale = 4;
+        neutral = target - 4 * y;
+    }
+    *r = camera_clamp(*r * scale + neutral);
+    *g = camera_clamp(*g * scale + neutral);
+    *b = camera_clamp(*b * scale + neutral);
 }
 
 static double tone_highlights(double y, double amount) {
@@ -240,10 +245,11 @@ static double tone_highlights(double y, double amount) {
     return camera_clamp(y + amount * weight * (y - 0.5));
 }
 
+// A gain both ways, at most 3.5× at +1, so black stays black as in Lightroom and a lift keeps each pixel's color.
 static double tone_shadows(double y, double amount) {
     double t = camera_clamp((0.5 - y) / 0.5);
     double weight = t * t;
-    if (amount >= 0) return camera_clamp(y + amount * weight * (0.5 - y));
+    if (amount >= 0) return camera_clamp(y + amount * weight * 2.5 * y);
     return camera_clamp(y + amount * weight * y);
 }
 

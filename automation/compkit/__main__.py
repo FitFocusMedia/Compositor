@@ -205,9 +205,10 @@ def show_command(args) -> int:
         if args.set:
             name, assignment = args.set
             field, _, text = assignment.partition("=")
-            if field not in ("rate", "gap", "distance", "max_moment", "auto_crop"):
-                raise CompError("profile settings that can be set: rate, gap, distance, max_moment, auto_crop")
-            value = text.lower() in ("true", "on", "yes", "1") if field == "auto_crop" else None if text == "none" else float(text)
+            if field not in ("rate", "per_moment", "gap", "distance", "max_moment", "auto_crop"):
+                raise CompError("profile settings that can be set: rate, per_moment, gap, distance, max_moment, auto_crop")
+            value = text.lower() in ("true", "on", "yes", "1") if field == "auto_crop" else None if text == "none" else \
+                int(text) if field == "per_moment" else float(text)
             shows.profile(name)  # an unknown profile fails here
             shows.save_profile(name, {field: value})
         names = sorted(set(shows.BUILT_IN) | set(shows.saved_profiles().get("profiles", {})))

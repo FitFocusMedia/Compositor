@@ -232,6 +232,15 @@ class ShowTests(unittest.TestCase):
             self.assertEqual(shows.saved_profiles()["preset"], "~/grade.xmp")
             self.assertEqual(self.new_show().data["preset"], str(self.preset.resolve()))
 
+    def test_a_profile_can_pick_by_quality_instead_of_a_rate(self):
+        shows.save_profile("workshop", {"per_moment": 1})
+        show = self.new_show()
+        shows.cull_show(show, sheets=False)
+        self.assertEqual(show.data["cull"]["per_moment"], 1)
+        good = {f["moment"] for f in show.frames() if f["status"] != "reject"}
+        picked = [f["moment"] for f in show.frames() if f["status"] == "pick"]
+        self.assertEqual(sorted(picked), sorted(good))  # the best good frame of every moment, however many that is
+
     def test_a_cull_resumes_and_one_bad_file_doesnt_stop_it(self):
         (self.card / "DSC09998.jpg").write_bytes(os.urandom(5000))  # damaged
         (self.card / "DSC09999.ARW").write_bytes(b"")  # empty
