@@ -8,8 +8,8 @@ interrupted cull picks up where it stopped and a re-cull of the same files takes
    prints closer than `distance`), as a burst or a held pose is; `max_moment` splits a run longer than that many
    seconds, for action where one scene runs on for minutes;
 2. flagged where something is clearly wrong: nothing anywhere in focus (well under the shoot's typical sharpest
-   spot, so a deliberately shallow focus isn't flagged), the main face's eyes shut, the frame far darker or brighter
-   than the shoot, a file that can't be read;
+   spot, so a deliberately shallow focus isn't flagged), a frame near black or a quarter blown out, a file that
+   can't be read (closed eyes and unusual brightness only lower the score, so they decide within a moment);
 3. scored 0–100 within the shoot: subject sharpness, face quality, eyes open, Vision's aesthetic score, exposure;
 4. picked (`assign`). Adaptive, for a keep rate or a count: picks are spread over the moments in proportion to each
    moment's size, so a long burst or a held pose gets more frames than a single shot, with the first frame of every
@@ -255,10 +255,13 @@ def judge(frames: list[dict]) -> None:
         # Nothing anywhere in focus (missed focus, motion blur); a deliberately shallow focus still has a sharp spot.
         if typical_peak and frame["peak_sharpness"] is not None and frame["peak_sharpness"] < 0.5 * typical_peak:
             flags.append("soft")
-        if frame["eyes"] is not None and frame["face_area"] > 0.004 and frame["eyes"] < 0.12:
-            flags.append("eyes closed")
-        if typical_light is not None and frame["lightness"] is not None and abs(frame["lightness"] - typical_light) > 22:
-            flags.append("too dark" if frame["lightness"] < typical_light else "too bright")
+        # Eyes only lower the score: a grin, glasses or stage light from above read as shut eyes as often as a blink.
+        # Exposure rejects only a frame that's near black or largely blown: on stage, lighting and framing swing a
+        # frame's brightness far more than exposure mistakes do.
+        if frame["lightness"] is not None and frame["lightness"] < 2:
+            flags.append("too dark")
+        if (frame.get("blown") or 0) > 25:
+            flags.append("too bright")
         frame["flags"] = flags
     sharp_rank = _rank([f["sharpness"] for f in frames])
     for frame, rank in zip(frames, sharp_rank):

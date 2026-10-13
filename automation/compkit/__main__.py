@@ -218,7 +218,9 @@ def show_command(args) -> int:
         data = shows.saved_profiles()
         for key in ("preset", "match"):
             if getattr(args, key):
-                data[key] = str(_Path(getattr(args, key)).expanduser().resolve())
+                path = _Path(getattr(args, key)).expanduser().absolute()
+                # Saved as ~/… under the home folder: profiles.json is shared between Macs with different user names.
+                data[key] = f"~/{path.relative_to(_Path.home())}" if path.is_relative_to(_Path.home()) else str(path)
         delivery = data.setdefault("delivery", {})
         if args.naming: delivery["naming"] = args.naming
         if args.folders: delivery["folders"] = args.folders
@@ -272,6 +274,16 @@ def show_command(args) -> int:
                 changes[known[photo]] = None if status == "auto" else status
         summary = shows.set_status(show.cull_folder, changes)
         print(json.dumps({**summary, "runner": showday.start_runner(show) if changes else None}, indent=2))
+        return 0
+    if step == "catalogue":
+        from . import lightcraft
+        if args.base:
+            summary = lightcraft.base(show, args.base)
+        elif args.export:
+            summary = lightcraft.export(show, prune=args.prune, folder=args.to)
+        else:
+            summary = lightcraft.sync(show)
+        print(json.dumps(summary, indent=2, default=str))
         return 0
     if step == "crop":
         known = {_Path(f["path"]).name: f["path"] for f in show.frames()} | {f["path"]: f["path"] for f in show.frames()}
@@ -450,6 +462,13 @@ def main(argv=None) -> int:
     step.add_argument("show")
     for status in ("pick", "alternate", "reject", "auto"):
         step.add_argument(f"--{status}", action="append", default=[], metavar="PHOTO", help=f"photos to mark {status}")
+    step = steps.add_parser("catalogue", help="the show as one LightCraft catalogue for the team (see compkit/lightcraft.py)")
+    step.add_argument("show")
+    step.add_argument("--base", action="append", default=[], metavar="PHOTO",
+                      help="photos adjusted by hand in LightCraft that become the show's base (repeat, one per lighting)")
+    step.add_argument("--export", action="store_true", help="write the Pick-flagged photos to the delivery spec")
+    step.add_argument("--prune", action="store_true", help="with --export: remove delivered files that aren't picks now")
+    step.add_argument("--to", metavar="FOLDER", help="with --export: deliver here instead of the show's delivery folder")
     step = steps.add_parser("crop", help="a photo's crop and leveling by hand")
     step.add_argument("show")
     step.add_argument("photo")

@@ -205,6 +205,17 @@ def run(show: shows.Show, *, hands_off: bool = True, notify_user: bool = True) -
                 return {"waiting": "no photos yet"}
             results["cull"] = shows.cull_show(show)
             show = shows.Show(show.folder)
+            if show.data.get("catalogue"):  # the team grades and delivers in LightCraft: keep the catalogue up to date
+                from . import lightcraft
+                try:
+                    results["catalogue"] = lightcraft.sync(show)
+                    notify_user and notify(show.data["name"], f"{results['catalogue']['imported']:,} new photos in the catalogue")
+                except CompError as error:
+                    notify_user and notify(show.data["name"], f"The catalogue wasn't updated: {error}")
+                    results["catalogue"] = {"error": str(error)}
+                if not pending.exists():
+                    return results
+                continue
             if not show.data.get("settings") and hands_off:
                 shows.setup_show(show)
                 shows.approve_setup(show, "B")

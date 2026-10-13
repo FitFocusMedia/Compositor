@@ -110,6 +110,19 @@ class PickingTests(unittest.TestCase):
         culling.assign(frames, per_moment=2, keep=3)
         self.assertEqual(sum(picks_per_moment(frames)), 3)
 
+    def test_grins_and_stage_lighting_arent_rejects(self):
+        measured = {"error": None, "peak_sharpness": 50.0, "sharpness": 40.0, "face_quality": 0.5, "aesthetics": 0.0,
+                    "utility": False, "face_area": 0.02, "blown": 0.0, "eyes": None, "lightness": 30.0}
+        frames = [frame("GRIN.JPG", 0, 0) | measured | {"eyes": 0.07}, frame("OPEN.JPG", 0, 1) | measured | {"eyes": 0.4},
+                  frame("BLUE.JPG", 1, 60) | measured | {"lightness": 80.0},
+                  frame("BLACK.JPG", 2, 120) | measured | {"lightness": 1.0},
+                  frame("BLOWN.JPG", 3, 180) | measured | {"lightness": 70.0, "blown": 40.0}]
+        culling.judge(frames)
+        self.assertEqual({f["name"]: f["flags"] for f in frames}, {"GRIN.JPG": [], "OPEN.JPG": [], "BLUE.JPG": [],
+                                                                  "BLACK.JPG": ["too dark"], "BLOWN.JPG": ["too bright"]})
+        culling.assign(frames, per_moment=1)  # the open-eyed frame of the moment still wins over the grin
+        self.assertEqual([f["name"] for f in frames if f["status"] == "pick"], ["OPEN.JPG", "BLUE.JPG"])
+
     def test_keep_rates_read_as_people_write_them(self):
         self.assertEqual(culling.parse_rate("35%"), 0.35)
         self.assertEqual(culling.parse_rate("35"), 0.35)
@@ -179,6 +192,45 @@ class ShowTests(unittest.TestCase):
             shows.profile("wedding")
         with self.assertRaises(CompError):  # the card is only ever read: no show inside it
             shows.Show.create(self.card / "show", cards=[self.card], profile_name="workshop", name="x")
+
+    def test_a_lightcraft_catalogue_round_trip(self):
+        from compkit import lightcraft
+        try:
+            lightcraft.cli()
+        except CompError:
+            self.skipTest("lightcraft-cli isn't installed")
+        show = self.new_show()
+        shows.cull_show(show, sheets=False)
+        status = {Path(f["path"]).name: f["status"] for f in show.frames()}
+        self.assertEqual(lightcraft.sync(show)["imported"], len(status))
+        with lightcraft.Catalogue(lightcraft.library(show)) as cat:
+            photos = {p["fileName"]: p for p in cat.photos().values()}
+            self.assertTrue(all((photos[n]["flag"], photos[n]["rating"]) == lightcraft.MARKS[s] for n, s in status.items()))
+            unpicked = next(n for n, s in sorted(status.items()) if s != "pick")
+            cat.command("photo.flag", flag="pick", ids=[photos[unpicked]["id"]])  # the team picks it in LightCraft
+            first, last = sorted(photos)[0], sorted(photos)[-1]
+            cat.tool("set_develop", id=photos[first]["id"], settings={"light": {"exposure": 0.4}})
+        self.assertEqual(lightcraft.sync(show)["changed by hand in LightCraft"], 1)
+        self.assertEqual({Path(f["path"]).name: f["status"] for f in show.frames()}[unpicked], "pick")  # holds in the show
+        self.assertEqual(lightcraft.base(show, [first])["photos given the new base"], len(status) - 1)
+        with lightcraft.Catalogue(lightcraft.library(show)) as cat:
+            ids = {p["fileName"]: p["id"] for p in cat.photos().values()}
+            self.assertEqual(cat.look(ids[last]), cat.look(ids[first]))
+        delivered = self.folder / "lightcraft delivery"
+        lightcraft.export(show, folder=delivered)
+        picks = [f for f in shows.Show(show.folder).frames() if f["status"] == "pick"]
+        planned = {o["path"].relative_to(show.delivery_root) for e in shows.delivery_plan(show, picks) for o in e["outputs"]}
+        self.assertEqual({p.relative_to(delivered) for p in delivered.rglob("*.jpg")}, planned)
+        self.assertFalse(list((self.card).glob("*.xmp")))  # nothing written next to the originals
+
+    def test_saved_defaults_work_on_another_mac(self):
+        from compkit.__main__ import main
+        import contextlib
+        import io
+        with mock.patch.dict(os.environ, {"HOME": str(self.folder)}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["show", "defaults", "--preset", str(self.preset)]), 0)
+            self.assertEqual(shows.saved_profiles()["preset"], "~/grade.xmp")
+            self.assertEqual(self.new_show().data["preset"], str(self.preset.resolve()))
 
     def test_a_cull_resumes_and_one_bad_file_doesnt_stop_it(self):
         (self.card / "DSC09998.jpg").write_bytes(os.urandom(5000))  # damaged

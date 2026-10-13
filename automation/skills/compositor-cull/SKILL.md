@@ -1,6 +1,6 @@
 ---
 name: compositor-cull
-description: Cull and process a whole shoot — hundreds or thousands of RAWs from a show, competition, fight night or event — down to the frames worth editing, then grade and export them with the user's Lightroom base grade. Use whenever the user has a folder/card of photos to sort, wants the best shots picked, bursts and duplicates collapsed, blurry or eyes-closed frames thrown out, a keep rate changed ("show me 35%", "give me 1,000"), a show's white balance settled, picks rated for Lightroom, a delivery exported to their spec, the pipeline compared with what they delivered, or a show taken from RAW to delivered images automatically — even if they just say "go through today's shoot" or "pick the best ones".
+description: Cull and process a whole shoot — hundreds or thousands of RAWs from a show, competition, fight night or event — down to the frames worth editing, then grade and export them with the user's Lightroom base grade. Use whenever the user has a folder/card of photos to sort, wants the best shots picked, bursts and duplicates collapsed, blurry or blacked-out frames thrown out, blinks passed over, a keep rate changed ("show me 35%", "give me 1,000"), a show's white balance settled, picks rated for Lightroom, a delivery exported to their spec, the pipeline compared with what they delivered, or a show taken from RAW to delivered images automatically — even if they just say "go through today's shoot" or "pick the best ones".
 ---
 
 # From a card to a delivered show
@@ -47,6 +47,14 @@ The runner picks up every change. From the command line:
 
 Installing the watcher creates standing launchd agents: only with the person's go-ahead.
 
+**A team working the show by hand** gets one LightCraft catalogue instead of a graded project per photo
+(`compkit show catalogue SHOW`; SHOW-RUNBOOK.md › "A show as one LightCraft catalogue"). Once made, the runner
+syncs it after each card's cull instead of grading and exporting: new photos come in with the base, the cull's
+decisions as flags and stars (pick = Pick ★3, alternate ★1, reject = Reject). A flag someone changes in LightCraft
+becomes the show's decision. When they've adjusted a photo or two by hand, `--base PHOTO` (one per lighting) makes
+those the base for every photo still on it; `--export` delivers the Pick-flagged photos to the spec. While they
+have it open, LightCraft must run with `--control 7980` for the toolkit to reach it.
+
 **Automatic crops** (`framing.suggest`: crop in around people at the photo's shape, level a tilted horizon) are
 off by default (`auto_crop`, per profile). On the person's workshop they matched their own crops no better than
 the whole frame. Vision's horizon misreads stage and room lines indoors (78 of 170 frames "tilted", none really).
@@ -75,7 +83,8 @@ Profiles/profiles.json` with the person's defaults: preset, look and delivery sp
 
 - **How picks are spread:** each moment (a burst or a held pose) gets frames in proportion to its size, so long
   bursts and held poses get more. Every moment's first frame comes before any moment's second, and flagged frames
-  (missed focus, eyes shut, far off exposure, unreadable) are never picked.
+  (missed focus, near black or a quarter blown out, unreadable) are never picked. Closed eyes and unusual
+  brightness only lower a frame's score, so they lose to a better frame of the same moment but aren't rejected.
 - **Re-dialing:** `compkit show pick SHOW --rate 35%` or `--count 1000` re-picks from the cull's scores and
   redraws the contact sheets in about a second. No frame is read again.
 

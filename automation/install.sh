@@ -19,6 +19,24 @@ else
   echo "==> comp-render is up to date"
 fi
 
+# LightCraft's command-line tool, for show catalogues (compkit/lightcraft.py). Pinned: LightCraft releases daily,
+# so a new version is taken on purpose, after a show catalogue has been tried with it.
+LIGHTCRAFT=0.6.0
+if [[ "$("$ROOT/bin/lightcraft-cli" --version 2>/dev/null)" != "lightcraft-cli $LIGHTCRAFT" ]]; then
+  echo "==> LightCraft command-line tool $LIGHTCRAFT"
+  tmp="$(mktemp -d)"
+  zip="lightcraft-cli-$LIGHTCRAFT-macos-universal.zip"
+  release="https://github.com/storytold/lightcraft/releases/download/v$LIGHTCRAFT"
+  curl -fsSL -o "$tmp/$zip" "$release/$zip"
+  curl -fsSL -o "$tmp/SHA256SUMS.txt" "$release/SHA256SUMS.txt"
+  (cd "$tmp" && grep " $zip\$" SHA256SUMS.txt | shasum -a 256 -c - > /dev/null)
+  ditto -x -k "$tmp/$zip" "$tmp"
+  spctl --assess --type install "$tmp/${zip%.zip}/lightcraft-cli"  # signed and notarized by its maker
+  mkdir -p "$ROOT/bin"
+  mv "$tmp/${zip%.zip}/lightcraft-cli" "$ROOT/bin/lightcraft-cli"
+  rm -rf "$tmp"
+fi
+
 echo "==> Python environment"
 [[ -x "$ROOT/.venv/bin/python" ]] || python3 -m venv "$ROOT/.venv"
 "$ROOT/.venv/bin/pip" install -q --disable-pip-version-check -r "$ROOT/requirements.txt"
@@ -26,6 +44,7 @@ echo "==> Python environment"
 echo "==> Commands in $BIN"
 mkdir -p "$BIN"
 ln -sf "$ROOT/bin/comp-render" "$BIN/comp-render"
+ln -sf "$ROOT/bin/lightcraft-cli" "$BIN/lightcraft-cli"
 for name in compkit compkit-python; do
   run='"$@"'; [[ $name == compkit ]] && run='-m compkit "$@"'
   cat > "$BIN/$name" <<LAUNCHER

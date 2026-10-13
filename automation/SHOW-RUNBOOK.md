@@ -65,6 +65,33 @@ automatic crops for a show type anyway:
 compkit show profiles --set competition auto_crop=true
 ```
 
+## A show as one LightCraft catalogue
+
+For a team working the show by hand alongside the automation: one Lightroom-style catalogue per show in
+[LightCraft](https://github.com/storytold/lightcraft), instead of a graded project per photo. Photos stay where
+the cards were copied (nothing is written next to them); the catalogue holds settings, flags, stars and 2048 px
+previews (about 0.2–0.5 MB a photo whatever the camera).
+
+```bash
+compkit show catalogue SHOW                     # make it, or bring it up to date (new cards, the cull's decisions)
+compkit show catalogue SHOW --base FFM01234.ARW # this hand-adjusted photo becomes the show's base
+compkit show catalogue SHOW --export            # the Pick-flagged photos to the delivery spec
+```
+
+- **After the first sync, cards keep it up to date:** the runner culls each card and syncs the catalogue instead of
+  grading and exporting. Open `SHOW/catalogue` in LightCraft. To keep working in it while cards come in, start
+  LightCraft with `--control 7980`; otherwise the runner waits until it's closed.
+- **The cull arrives as flags and stars:** picks are Pick ★3, alternates ★1, rejects Reject. Change any of them in
+  LightCraft: a changed flag becomes the show's decision and is never overwritten; stars are yours to use.
+- **The base:** new photos get God Tones. Adjust a photo or two in LightCraft until they look right, then make
+  them the base: every photo still on the base takes the settings of the base photo shot nearest it (one per
+  lighting or round), photos someone adjusted by hand are left alone, and each base is also a preset in the
+  show's group. The adjusted photos are kept in `SHOW/catalogue.json` as samples for learning the look later.
+- **Export:** the same folders and names as `compkit show export`, from LightCraft's own export; `--prune` removes
+  delivered files that are no longer picks, `--to FOLDER` delivers elsewhere.
+- LightCraft renders God Tones in its own way (warmer or cooler than our grade depending on the camera), which is
+  what the hand-adjusted base is for.
+
 ## Step by step
 
 These are the same steps the automation runs, for running a show by hand or redoing one step.
@@ -130,7 +157,8 @@ compkit show pick SHOW --count 1000
 ```
 
 Bigger moments get more frames, and every moment gets one before any gets a second. Rejected frames (missed
-focus, eyes shut, far off exposure) are never picked.
+focus, near black or a quarter blown out) are never picked. Closed eyes and unusual brightness only lower a frame's
+score: on stage a grin, glasses or top light reads as shut eyes, and the lighting changes from round to round.
 
 ### 4. Setup: white balance and exposure, about 10 seconds
 
