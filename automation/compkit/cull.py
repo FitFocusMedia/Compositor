@@ -5,8 +5,10 @@ so a few thousand frames take a minute or two. With a cache folder, finished fra
 interrupted cull picks up where it stopped and a re-cull of the same files takes seconds. Frames are then:
 
 1. grouped into moments: consecutive frames shot within `gap` seconds of each other that look alike (Vision feature
-   prints closer than `distance`), as a burst or a held pose is; `max_moment` splits a run longer than that many
-   seconds, for action where one scene runs on for minutes;
+   prints closer than `distance`) and line up as one view, the camera turning no more than `pan` of the frame
+   between them, as a burst or a held pose is; a lineup shot athlete by athlete in the same pose looks alike but
+   is as many moments as athletes. `max_moment` splits a run longer than that many seconds, for action where one
+   scene runs on for minutes;
 2. flagged where something is clearly wrong: nothing anywhere in focus (well under the shoot's typical sharpest
    spot, so a deliberately shallow focus isn't flagged), a frame near black or a quarter blown out, a file that
    can't be read (closed eyes and unusual brightness only lower the score, so they decide within a moment);
@@ -42,9 +44,15 @@ from .runlog import Progress
 
 PICTURE_SUFFIXES = RAW_SUFFIXES | {".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff", ".png"}
 # What a cached frame was measured with; bump when probe or score output changes.
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 # The per-moment rule (see `assign`), as calibrated on a posed shoot (429 frames, 170 delivered).
 DEFAULT_RULE = {"tau": 0.3, "cover": 1.0, "beta": 0.0}
+# Two frames are one view when, lined up, their edges match at least this well (see `_line_up`). Calibrated on ICN
+# Nationals 2026 lineups: one athlete's burst or held pose matched at 0.5 and up (one at 0.49), the next athlete
+# along at 0.47 and under.
+# shortcut: whole frames are lined up, so a lineup whose athletes and stage lights repeat evenly can line up at a
+# wrong shift and stay one moment (2 of 18 checked pairs); add a check of the main subject if that shows up.
+ALIGNED = 0.5
 
 
 def gather(inputs) -> list[Path]:
@@ -188,11 +196,38 @@ def _scene_ev(probe: dict) -> float | None:
     return round(math.log2(aperture * aperture / shutter) - math.log2(iso / 100), 2)
 
 
+def _line_up(a: np.ndarray, b: np.ndarray, reach: float = 0.6, drift: float = 0.1) -> tuple[float, float]:
+    """How far the camera turned between two frames' thumbnails, as a share of the frame width, and how well they
+    match once lined up (correlation of their edges, up to 1): the best of every shift up to `reach` of the width
+    sideways and `drift` of the height up or down. Edges, not brightness, so a change of exposure doesn't count."""
+    def edges(x):
+        x = x.astype(np.float64)
+        return np.hypot(np.diff(x, axis=1)[:-1], np.diff(x, axis=0)[:, :-1])
+    a, b = edges(a), edges(b)
+    h, w = a.shape
+    shape = (2 * h, 2 * w)  # zero-padded, so a shift doesn't wrap around
+    fa, fb, fone, faa, fbb = (np.fft.rfft2(x, shape) for x in (a, b, np.ones_like(a), a * a, b * b))
+
+    def over(f, g):  # Σ f·g over the overlap, for every shift at once
+        return np.fft.irfft2(f * np.conj(g), shape)
+    n, sa, sb = over(fone, fone), over(fa, fone), over(fone, fb)
+    with np.errstate(invalid="ignore", divide="ignore"):  # shifts past the edge overlap nothing
+        va, vb = over(faa, fone) - sa * sa / n, over(fone, fbb) - sb * sb / n
+        match = (over(fa, fb) - sa * sb / n) / np.sqrt(va * vb)
+    dy = np.abs(np.fft.fftfreq(shape[0], 1 / shape[0]))[:, None]
+    dx = np.abs(np.fft.fftfreq(shape[1], 1 / shape[1]))[None, :]
+    # An overlap without edges (a black frame) can't be lined up.
+    match[(dy > drift * h) | (dx > reach * w) | ~(np.minimum(va, vb) > n)] = -1
+    best = np.unravel_index(np.argmax(match), match.shape)
+    return round(float(dx[0, best[1]] / w), 3), round(float(match[best]), 3)
+
+
 def frames_from(entries: list[dict]) -> list[dict]:
-    """One dict per frame in capture order, with its measurements and the feature-print distance to the frame
-    before it (Vision's distance is the plain Euclidean one between prints, so it's computed here and order-free)."""
+    """One dict per frame in capture order, with its measurements, the feature-print distance to the frame before
+    it (Vision's distance is the plain Euclidean one between prints, so it's computed here and order-free) and how
+    the two line up (`_line_up`: pan and match)."""
     ordered = sorted(entries, key=lambda e: (e["probe"].get("captured") or "", Path(e["path"]).name))
-    frames, previous = [], None
+    frames, previous, previous_thumb, previous_shape = [], None, None, None
     for entry in ordered:
         probe, score = entry["probe"], entry["score"]
         faces = score.get("faces") or []
@@ -202,6 +237,15 @@ def frames_from(entries: list[dict]) -> list[dict]:
         distance = float(np.linalg.norm(feature - previous)) if feature is not None and previous is not None \
             and feature.shape == previous.shape else None
         previous = feature
+        thumb = None
+        if score.get("thumb"):
+            raw = np.frombuffer(base64.b64decode(score["thumb"]), dtype=np.uint8)
+            thumb = raw.reshape(math.isqrt(raw.size), -1)
+        pan = match = None
+        if thumb is not None and previous_thumb is not None:
+            # A frame turned the other way, or another camera's, is another view whatever its print says.
+            pan, match = _line_up(previous_thumb, thumb) if score.get("preview") == previous_shape else (None, 0.0)
+        previous_thumb, previous_shape = thumb, score.get("preview")
         frames.append({
             "path": entry["path"], "name": Path(entry["path"]).name, "captured": captured,
             "aesthetics": score.get("aesthetics"), "utility": score.get("utility"),
@@ -210,7 +254,8 @@ def frames_from(entries: list[dict]) -> list[dict]:
             "eyes": min(main["eyes"]) if main and main.get("eyes") else None,
             "face_area": main["box"][2] * main["box"][3] if main else 0.0,
             "lightness": score.get("lightness"), "blown": score.get("blown"),
-            "distance": round(distance, 5) if distance is not None else None, "error": score.get("error"),
+            "distance": round(distance, 5) if distance is not None else None, "pan": pan, "match": match,
+            "error": score.get("error"),
             "iso": probe.get("iso"), "ev": _scene_ev(probe), "rating": probe.get("rating"),
             "camera": probe.get("camera"), "width": probe.get("width"), "height": probe.get("height"),
         })
@@ -223,7 +268,8 @@ def _time(frame) -> dt.datetime | None:
     return dt.datetime.strptime(frame["captured"], "%Y-%m-%d %H:%M:%S.%f") if frame.get("captured") else None
 
 
-def group(frames: list[dict], *, gap: float = 2.0, distance: float = 0.6, max_moment: float | None = None) -> int:
+def group(frames: list[dict], *, gap: float = 2.0, distance: float = 0.6, max_moment: float | None = None,
+          pan: float = 0.25) -> int:
     """Numbers each frame's moment (frames in capture order); returns how many moments there are."""
     moment, first, previous = -1, None, None
     for frame in frames:
@@ -232,8 +278,12 @@ def group(frames: list[dict], *, gap: float = 2.0, distance: float = 0.6, max_mo
         if not new:
             seconds = (when - previous).total_seconds() if when and previous else math.inf
             alike = (frame["distance"] if frame["distance"] is not None else math.inf) <= distance
+            # Panning along a lineup, the next athlete in the same pose looks alike to a feature print; the camera
+            # turning (or the frames not lining up at all) tells them apart. A frame with nothing to line up (no
+            # thumbnail) groups by time and print alone.
+            steady = frame.get("match") is None or (frame["match"] >= ALIGNED and frame["pan"] <= pan)
             too_long = max_moment is not None and when and first and (when - first).total_seconds() > max_moment
-            new = not (seconds <= gap and alike) or bool(too_long)
+            new = not (seconds <= gap and alike and steady) or bool(too_long)
         if new:
             moment += 1
             first = when

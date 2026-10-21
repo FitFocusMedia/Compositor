@@ -103,6 +103,40 @@ class PickingTests(unittest.TestCase):
         self.assertEqual(culling.group(frames, gap=2, distance=0.6), 1)
         self.assertEqual(culling.group(frames, gap=2, distance=0.6, max_moment=4), 3)
 
+    def test_a_lineup_shot_athlete_by_athlete_is_a_moment_each(self):
+        # Panning along five athletes holding the same pose: alike to a feature print, but the camera turns about half
+        # a frame from one to the next. One athlete's held pose is shot from a steady camera.
+        lineup, pose = moments(5), moments(4, spacing=0.5)
+        for f in lineup[1:]:
+            f.update(distance=0.4, pan=0.55, match=0.8)
+        for f in pose[1:]:
+            f.update(distance=0.2, pan=0.03, match=0.9)
+        self.assertEqual(culling.group(lineup), 5)
+        self.assertEqual(culling.group(pose), 1)
+        for f in lineup[1:]:  # the next athlete filling a tight frame: nothing lines up
+            f.update(pan=0.02, match=0.2)
+        self.assertEqual(culling.group(lineup), 5)
+        for f in lineup[1:]:  # nothing to line up: time and print alone, as before
+            f.update(pan=None, match=None)
+        self.assertEqual(culling.group(lineup), 1)
+
+    def test_lining_frames_up_finds_how_far_the_camera_turned(self):
+        rng = np.random.default_rng(7)
+
+        def scene(width):  # soft shapes, as a stage looks shrunk to a thumbnail
+            small = Image.fromarray((rng.random((12, width // 4)) * 200).astype(np.uint8))
+            return np.asarray(small.resize((width, 48), Image.BILINEAR), dtype=np.float64)
+        stage = scene(120)  # wider than a frame, for the camera to turn along
+        view = stage[:, :48]
+        turned = culling._line_up(view, stage[:, 24:72])
+        self.assertAlmostEqual(turned[0], 24 / 47, delta=0.03)  # thumbnails' edges are 47 wide
+        self.assertGreater(turned[1], 0.9)
+        steady = culling._line_up(view, view * 0.7 + rng.random(view.shape) * 10)  # darker, a little noise
+        self.assertEqual(steady[0], 0)
+        self.assertGreater(steady[1], culling.ALIGNED)
+        self.assertLess(culling._line_up(view, scene(48))[1], culling.ALIGNED)
+        self.assertEqual(culling._line_up(view, np.zeros_like(view))[1], -1)  # a black frame lines up with nothing
+
     def test_fixed_picks_per_moment_still_work(self):
         frames = moments(1, 3, 5)
         culling.assign(frames, per_moment=2)
@@ -311,6 +345,12 @@ class ShowTests(unittest.TestCase):
         vision = json.loads(culling._run_listed("score", ordered))
         for f, v in list(zip(frames, vision))[1:]:
             self.assertAlmostEqual(f["distance"], v["distanceToPrevious"], places=4)
+
+    def test_a_burst_lines_up_and_the_next_scene_doesnt(self):
+        frames = culling.frames_from(culling.scan(sorted(culling.gather([self.card]))))
+        burst, scene = frames[1:3], frames[3]  # the first burst's frames, then the held pose's first
+        self.assertTrue(all(f["match"] >= culling.ALIGNED and f["pan"] < 0.05 for f in burst))
+        self.assertLess(scene["match"], culling.ALIGNED)
 
     def test_a_whole_show(self):
         show = self.new_show()

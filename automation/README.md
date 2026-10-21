@@ -87,7 +87,8 @@ photographer's own crops.
 - `comp-render probe` reads metadata, and `comp-render score` measures on every core: Apple's aesthetic score,
   face capture quality and eye openness, sharpness of the subject in focus, a peak-sharpness check for missed
   focus, exposure, and the Vision feature print.
-- Frames group into moments: consecutive, within 2 s, alike.
+- Frames group into moments: consecutive, within 2 s, alike, and one view. A pan along a lineup to the next
+  athlete in the same pose starts a new moment, since only the camera turning tells them apart.
 - Clear failures are rejected: nothing in focus, eyes shut, far off exposure.
 - Picks follow a keep rate or count. Each moment gets frames in proportion to its size, so a long burst or a held
   pose gets more than a single shot. Every moment's first frame comes before any moment's second.

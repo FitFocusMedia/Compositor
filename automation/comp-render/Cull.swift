@@ -80,6 +80,9 @@ nonisolated struct FrameScore: Encodable, Sendable {
     /// Mean lightness (L*, 0–100) of the preview and the share of blown and crushed pixels.
     var lightness: Double?
     var blown: Double?, crushed: Double?
+    /// The preview squeezed to 48 × 48 gray pixels (base64, top row first): enough to line two frames up and see
+    /// whether the camera turned between them.
+    var thumb: String?
     /// Distance between this frame's and the previous frame's Vision feature prints (0 identical; under ~0.5 the
     /// same moment), when frames were given in capture order.
     var distanceToPrevious: Double?
@@ -156,6 +159,13 @@ nonisolated enum Culling {
             return (result, nil)
         }
         result.preview = [image.width, image.height]
+        var thumb = [UInt8](repeating: 0, count: 48 * 48)
+        if let context = CGContext(data: &thumb, width: 48, height: 48, bitsPerComponent: 8, bytesPerRow: 48,
+                                   space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) {
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: 48, height: 48))
+            result.thumb = Data(thumb).base64EncodedString()
+        }
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
         let aesthetics = VNCalculateImageAestheticsScoresRequest()
         let quality = VNDetectFaceCaptureQualityRequest()

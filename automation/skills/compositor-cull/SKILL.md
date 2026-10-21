@@ -77,7 +77,7 @@ Profiles/profiles.json` with the person's defaults: preset, look and delivery sp
 
 | Profile | Starting keep rate | Grouping | Notes |
 | --- | --- | --- | --- |
-| workshop | 40% | frames within 2 s that look alike | calibrated on the person's posing workshop |
+| workshop | 40% | frames within 2 s that look alike, from a steady camera (a pan to the next athlete is a new moment) | calibrated on the person's posing workshop |
 | competition | 40% (varies by show) | as workshop | untested: learn from the first delivered show; the person keeps frames a crop or straighten can rescue |
 | fight-night | 20% | within 1 s; a run of one scene splits every 4 s | untested: a fast-burst frame counts for less |
 
