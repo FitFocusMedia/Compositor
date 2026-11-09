@@ -221,6 +221,11 @@ class ShowTests(unittest.TestCase):
         picks = [f for f in shows.Show(show.folder).frames() if f["status"] == "pick"]
         planned = {o["path"].relative_to(show.delivery_root) for e in shows.delivery_plan(show, picks) for o in e["outputs"]}
         self.assertEqual({p.relative_to(delivered) for p in delivered.rglob("*.jpg")}, planned)
+        again = lightcraft.export(show, folder=delivered)  # nothing changed: nothing is rendered again
+        self.assertEqual((again["written"], again["already up to date"]), (0, len(planned)))
+        with lightcraft.Catalogue(lightcraft.library(show)) as cat:
+            cat.tool("set_develop", id=ids[Path(picks[0]["path"]).name], settings={"light": {"exposure": -0.3}})
+        self.assertEqual(lightcraft.export(show, folder=delivered)["written"], 2)  # just that photo, in both sizes
         self.assertFalse(list((self.card).glob("*.xmp")))  # nothing written next to the originals
 
     def test_saved_defaults_work_on_another_mac(self):

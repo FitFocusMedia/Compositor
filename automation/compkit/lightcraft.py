@@ -39,6 +39,8 @@ MARKS = {"pick": ("pick", 3), "alternate": ("none", 1), "reject": ("reject", 0)}
 # Settings that belong to one photo, not to a look: develop.copy leaves them out, and changing them isn't
 # taking a photo off the base.
 OWN = {"crop", "masks", "spots", "red_eye", "orientation", "geometry", "version"}
+# Photos per export command: about half a minute at 61 MP, well inside the running app's command timeout.
+BATCH = 24
 
 
 def cli() -> str:
@@ -52,7 +54,7 @@ class Catalogue:
     """An MCP session with lightcraft-cli on one library: headless, or the running app when it has the library open."""
 
     def __init__(self, library: Path):
-        self.calls = 0
+        self.calls, self.connected = 0, False
         try:
             self._start(["mcp", "--library", str(library)])
         except CompError as error:
@@ -61,6 +63,7 @@ class Catalogue:
             address = os.environ.get("LIGHTCRAFT_CONTROL", "127.0.0.1:7980")
             try:
                 self._start(["mcp", "--connect", address])
+                self.connected = True
             except CompError:
                 raise CompError(f"the catalogue is open in LightCraft without its control port: start LightCraft with "
                                 f"`--control {address.rsplit(':', 1)[-1]}`, or close it, and run this again") from None
@@ -100,7 +103,13 @@ class Catalogue:
         result = self._call("tools/call", {"name": name, "arguments": arguments})
         if result.get("isError"):
             raise CompError(f"LightCraft {name}: {' '.join(c.get('text', '') for c in result.get('content', []))}")
-        return result.get("structuredContent")
+        if result.get("structuredContent") is not None:
+            return result["structuredContent"]
+        text = "".join(c.get("text", "") for c in result.get("content", []))  # a list result comes back as text only
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None  # a command with nothing to return says so in words
 
     def command(self, command: str, **params):
         return self.tool("command_run", id=command, params=params)
@@ -184,8 +193,10 @@ def sync(show: shows.Show) -> dict:
         new = cat.command("library.import", paths=cards, mode="add")["imported"]
         photos = cat.photos()
         _give(cat, state, photos, new)
-        if new:
-            cat.command("library.buildPreviews", ids=new, size="standard", wait=True)
+        if new and cat.connected:
+            # In the open app's background. Headless, waiting would lock the catalogue for hours on a big RAW show
+            # (about a second a photo); the app renders what's viewed anyway.
+            cat.command("library.buildPreviews", ids=new, size="standard", wait=False)
         by_hand, marks = {}, {}
         for path, photo in cat.ids(cards).items():
             frame, now = frames.get(path), [photos[photo]["flag"], photos[photo]["rating"]]
@@ -255,7 +266,10 @@ def base(show: shows.Show, names: list[str]) -> dict:
 
 def export(show: shows.Show, *, prune: bool = False, folder=None) -> dict:
     """Writes the Pick-flagged photos to the show's delivery spec from LightCraft: the folders and names of
-    `compkit show export` (shows.delivery_plan), into `folder` instead of the show's delivery folder if given."""
+    `compkit show export` (shows.delivery_plan), into `folder` instead of the show's delivery folder if given. Only
+    what's new or changed is rendered: a file already delivered from the same settings is kept."""
+    state = _state(show)
+    done = state.setdefault("exported", {})
     cards = [str(Path(c)) for c in show.data["cards"]]
     culled = {f["path"]: f for f in show.frames()} if (show.cull_folder / "cull.json").exists() else {}
     root = shows._clean(show.data["name"])
@@ -268,7 +282,8 @@ def export(show: shows.Show, *, prune: bool = False, folder=None) -> dict:
                   for p, i in picks.items()]
         plan = shows.delivery_plan(show, frames)
         quality = round(show.delivery.get("quality", 0.92) * 100)
-        written = 0
+        settings = {i: json.dumps(cat.tool("get_develop", id=i), sort_keys=True) for i in picks.values()}
+        written = kept = 0
         for n, size in enumerate(show.delivery["sizes"]):
             by_folder: dict[Path, list[tuple[int, Path]]] = {}
             for entry in plan:
@@ -277,27 +292,41 @@ def export(show: shows.Show, *, prune: bool = False, folder=None) -> dict:
             options = {"longEdge": size.get("max_side") or 0, "quality": quality, "metadata": "all", "conflict": "overwrite"}
             if size.get("max_kb"):
                 options["limitKb"] = size["max_kb"]
+            made_from = lambda i: hashlib.sha1((settings[i] + json.dumps(options, sort_keys=True)).encode()).hexdigest()
             for out_folder, items in by_folder.items():
+                due = [(i, out) for i, out in items if not out.exists() or done.get(str(out)) != made_from(i)]
+                kept += len(items) - len(due)
+                if not due:
+                    continue
+                items = due
                 staging = out_folder / ".lightcraft"
                 staging.mkdir(parents=True, exist_ok=True)
-                # One batch per folder (LightCraft renders a batch in parallel), named by the original's name, then
-                # moved to the planned names; a name two picks share goes on its own.
-                stems = Counter(Path(photos[i]["fileName"]).stem for i, _ in items)
-                batch = [(i, out) for i, out in items if stems[Path(photos[i]["fileName"]).stem] == 1]
-                if batch:
-                    cat.command("app.export", ids=[i for i, _ in batch], dir=str(staging), naming="{name}", **options)
-                for i, out in items:
-                    made = staging / f"{Path(photos[i]['fileName']).stem}.jpg"
-                    if (i, out) not in batch:
-                        made = staging / f"{i}.jpg"
-                        cat.command("app.export", ids=[i], path=str(made), **options)
-                    made.replace(out)
-                    written += 1
-                shutil.rmtree(staging, ignore_errors=True)
+                try:
+                    # Batches (LightCraft renders a batch in parallel), named by the original's name, then moved to
+                    # the planned names; a name two picks share goes on its own. Batches stay small: the running
+                    # app's control channel times out a long command.
+                    stems = Counter(Path(photos[i]["fileName"]).stem for i, _ in items)
+                    batch = [(i, out) for i, out in items if stems[Path(photos[i]["fileName"]).stem] == 1]
+                    for start in range(0, len(batch), BATCH):
+                        part = batch[start:start + BATCH]
+                        cat.command("app.export", ids=[i for i, _ in part], dir=str(staging), naming="{name}", **options)
+                        for i, out in part:
+                            (staging / f"{Path(photos[i]['fileName']).stem}.jpg").replace(out)
+                            done[str(out)] = made_from(i)
+                            written += 1
+                    for i, out in items:
+                        if (i, out) not in batch:
+                            cat.command("app.export", ids=[i], path=str(staging / f"{i}.jpg"), **options)
+                            (staging / f"{i}.jpg").replace(out)
+                            done[str(out)] = made_from(i)
+                            written += 1
+                finally:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    shows._write_json(show.folder / "catalogue.json", state)  # an interrupted export resumes from here
     expected = {target / o["path"].relative_to(show.delivery_root / root) for e in plan for o in e["outputs"]}
     extra = [p for p in target.rglob("*.jpg") if p not in expected] if target.exists() else []
     if prune:
         for path in extra:
             path.unlink()
-    return {"delivery": str(target), "picks": len(picks), "written": written,
+    return {"delivery": str(target), "picks": len(picks), "written": written, "already up to date": kept,
             "delivered files that aren't picks": len(extra), "removed": len(extra) if prune else 0}

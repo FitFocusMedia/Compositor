@@ -508,5 +508,8 @@ def write_ratings(frames: list[dict], *, pick: int = 3, alternate: int = 1) -> d
             '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
             f'  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="{rating}"/>\n'
             ' </rdf:RDF>\n</x:xmpmeta>\n')
+        # On exFAT (cards, Windows-shared drives) macOS keeps the new file's provenance tag in a hidden ._ file, a
+        # whole allocation block each (1 MB on big drives): drop it, it holds nothing Lightroom reads.
+        sidecar.with_name("._" + sidecar.name).unlink(missing_ok=True)
         written += 1
     return {"written": written, "skipped (sidecar already there)": skipped}
