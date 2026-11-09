@@ -117,6 +117,34 @@ struct CameraRawTests {
         #expect(shadowViz[0] == [0, 0, 0, 255] && shadowViz[1] == [255, 255, 255, 255], "shadow clipping is not the grade: \(shadowViz)")
     }
 
+    @Test func darkLiftsKeepADimWarmPicturesColor() throws {
+        // A dim indoor RAW: a warm cast over near-black noise, where a lift once multiplied (3, 0, 0) into pure red.
+        let colors = [[3, 0, 0], [4, 1, 0], [10, 4, 1], [26, 15, 5], [40, 22, 8], [0, 0, 2], [1, 0, 3], [0, 0, 0]]
+        let context = try BrushRaster.context(width: colors.count, height: 1, mask: false)
+        for (x, color) in colors.enumerated() {
+            context.setFillColor(CGColor(srgbRed: CGFloat(color[0]) / 255, green: CGFloat(color[1]) / 255, blue: CGFloat(color[2]) / 255, alpha: 1))
+            context.fill(CGRect(x: x, y: 0, width: 1, height: 1))
+        }
+        let dim = try #require(context.makeImage())
+        func sums(_ pixels: [[Int]]) -> [Double] { (0..<3).map { channel in Double(pixels.map { $0[channel] }.reduce(0, +)) } }
+        let before = sums(try pixels(dim))
+        var settings = CameraRawSettings()
+        settings.shadows = 30
+        let lifted = try pixels(settings.apply(dim))
+        let after = sums(lifted)
+        #expect(after[1] > before[1] * 1.3, "shadows +30 lifts the picture: \(lifted)")
+        for channel in [0, 2] {
+            let drift = (after[channel] / after[1]) / (before[channel] / before[1])
+            #expect(abs(drift - 1) < 0.1, "channel \(channel) keeps its share against green: \(lifted)")
+        }
+        #expect(lifted[7] == [0, 0, 0, 255], "black stays black: \(lifted)")
+
+        settings = CameraRawSettings()
+        settings.blacks = 30
+        let floor = try pixels(settings.apply(dim))
+        #expect([0, 5, 6].allSatisfy { chroma(floor[$0]) < 16 }, "blacks +30 lifts near-black noise as gray, not color: \(floor)")
+    }
+
     @Test func temperatureWarmsAndTintMovesTowardMagenta() throws {
         let input = try gray()
         var settings = CameraRawSettings()
