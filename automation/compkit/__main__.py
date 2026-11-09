@@ -295,14 +295,14 @@ def show_command(args) -> int:
         return 0
     if step == "cull":
         summary = shows.cull_show(show, rate=parse_rate(args.rate) if args.rate else None, count=args.count,
-                                  sheets=not args.no_sheets)
+                                  sheets=not args.no_sheets, runsheet=args.runsheet, min_solo=args.min_solo)
         summary["next"] = f"look at {show.cull_folder / 'sheets'}, re-dial with `compkit show pick`, then " \
                           f"`compkit show setup {show.folder}`"
     elif step == "pick":
         import time
         began = time.monotonic()
         summary = shows.pick_show(show, rate=parse_rate(args.rate) if args.rate else None, count=args.count,
-                                  per_moment=args.per_moment, sheets=not args.no_sheets)
+                                  per_moment=args.per_moment, sheets=not args.no_sheets, min_solo=args.min_solo)
         summary["seconds"] = round(time.monotonic() - began, 1)
     elif step == "setup":
         if args.approve:
@@ -411,12 +411,18 @@ def main(argv=None) -> int:
     step.add_argument("show")
     step.add_argument("--rate", help="override the profile's keep rate (e.g. 35%%)")
     step.add_argument("--count", type=lambda v: int(v.replace(",", "")), help="keep this many instead")
+    step.add_argument("--runsheet", help="the competitors (CSV or JSON: number, name, divisions), to tell athletes "
+                      "apart by hip number; kept with the show")
+    step.add_argument("--min-solo", type=int, help="with a run sheet, picks of each athlete alone in frame to reach "
+                      "(default: the profile's; 0 turns it off); kept with the show")
     step.add_argument("--no-sheets", action="store_true")
     step = steps.add_parser("pick", help="re-dial the keep rate from the cull's scores, in seconds")
     step.add_argument("show")
     step.add_argument("--rate", help="e.g. 35%%")
     step.add_argument("--count", type=lambda v: int(v.replace(",", "")), help="e.g. 1000")
     step.add_argument("--per-moment", type=int)
+    step.add_argument("--min-solo", type=int, help="promote alternates until every athlete on the run sheet has this "
+                      "many picks alone in frame; without --rate or --count, every other pick stays as it is")
     step.add_argument("--no-sheets", action="store_true")
     step = steps.add_parser("setup", help="the white balance and exposure sheet, and approving it")
     step.add_argument("show")

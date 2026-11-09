@@ -1,6 +1,6 @@
 ---
 name: compositor-cull
-description: Cull and process a whole shoot — hundreds or thousands of RAWs from a show, competition, fight night or event — down to the frames worth editing, then grade and export them with the user's Lightroom base grade. Use whenever the user has a folder/card of photos to sort, wants the best shots picked, bursts and duplicates collapsed, blurry or blacked-out frames thrown out, blinks passed over, a keep rate changed ("show me 35%", "give me 1,000"), a show's white balance settled, picks rated for Lightroom, a delivery exported to their spec, the pipeline compared with what they delivered, or a show taken from RAW to delivered images automatically — even if they just say "go through today's shoot" or "pick the best ones".
+description: Cull and process a whole shoot — hundreds or thousands of RAWs from a show, competition, fight night or event — down to the frames worth editing, then grade and export them with the user's Lightroom base grade. Use whenever the user has a folder/card of photos to sort, wants the best shots picked, bursts and duplicates collapsed, blurry or blacked-out frames thrown out, blinks passed over, a keep rate changed ("show me 35%", "give me 1,000"), every athlete given enough photos of their own from the run sheet, a show's white balance settled, picks rated for Lightroom, a delivery exported to their spec, the pipeline compared with what they delivered, or a show taken from RAW to delivered images automatically — even if they just say "go through today's shoot" or "pick the best ones".
 ---
 
 # From a card to a delivered show
@@ -13,6 +13,8 @@ show. Commands come from the toolkit (if missing, use the compositor-toolkit ski
 compkit show new SHOW --card CARD-COPY --profile competition --name "Spring Classic"   # [--naming "…"] [--date …]
 compkit show cull SHOW                    # ★ review SHOW/cull/sheets
 compkit show pick SHOW --rate 35%         # re-dial in seconds (or --count 1000)
+compkit show cull SHOW --runsheet R.csv   # competitions: athletes by hip number → SHOW/cull/athletes.csv
+compkit show pick SHOW --min-solo 15      # promote until every athlete has 15 picks alone in frame
 compkit show setup SHOW                   # ★ the person approves from SHOW/setup/setup-sheet.jpg …
 compkit show setup SHOW --approve B       # … for the whole show, or --approve 1=B,2=C,… per lighting
 compkit show grade SHOW
@@ -87,6 +89,15 @@ Profiles/profiles.json` with the person's defaults: preset, look and delivery sp
   brightness only lower a frame's score, so they lose to a better frame of the same moment but aren't rejected.
 - **Re-dialing:** `compkit show pick SHOW --rate 35%` or `--count 1000` re-picks from the cull's scores and
   redraws the contact sheets in about a second. No frame is read again.
+- **Every athlete covered (competitions):** with the run sheet (`show cull SHOW --runsheet FILE`: CSV or JSON,
+  number, name, divisions; kept with the show), frames where one person stands alone are matched to athletes by the
+  number on their hip. Anyone under 15 such picks (`--min-solo`, the competition default) gets their best solo
+  alternates, one per moment. `SHOW/cull/athletes.csv` has each athlete's solo picks, solo alternates and promotions.
+  The summary names who is still short and which numbers were never read. Say plainly: only frames whose number was
+  read count, so someone listed as short may not be; a never-read number is often a scratch, but not always (two ICN
+  buyers were never read). Each show folder balances on its own, so two photographers' folders can't see each other.
+  On ICN Nationals 2026 (17,261 frames): 41% of solo frames identified, 99.4% agreeing with reads checked against
+  the delivered gallery; 783 alternates promoted (+9% picks); median identified solo picks per athlete 9 → 15.
 
 What to say about its judgment, plainly. Against the person's 170 delivered frames from their 429-frame posing
 workshop:

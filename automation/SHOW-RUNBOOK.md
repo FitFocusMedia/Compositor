@@ -160,6 +160,20 @@ Bigger moments get more frames, and every moment gets one before any gets a seco
 focus, near black or a quarter blown out) are never picked. Closed eyes and unusual brightness only lower a frame's
 score: on stage a grin, glasses or top light reads as shut eyes, and the lighting changes from round to round.
 
+At a competition, give the cull the run sheet (CSV or JSON with number, name and divisions) so every athlete gets
+enough photos of their own. It's kept with the show, so later cards and re-dials use it too:
+
+```bash
+compkit show cull SHOW --runsheet runsheet.csv
+compkit show pick SHOW --min-solo 15     # only promotes: every other pick stays as it is
+```
+
+Frames where one person stands alone are matched to athletes by the number on their hip. Anyone with fewer than 15
+such picks (the competition profile's default; `--min-solo 0` turns it off) gets their best solo alternates, one
+per moment. `SHOW/cull/athletes.csv` lists each athlete's solo picks, solo alternates and promotions. The summary
+names anyone still short, and any run-sheet number never read (most likely a scratch). Only frames whose number was
+read count, so real coverage is higher than the table says.
+
 ### 4. Setup: white balance and exposure, about 10 seconds
 
 ```bash

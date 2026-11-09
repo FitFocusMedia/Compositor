@@ -89,6 +89,24 @@ nonisolated struct FrameScore: Encodable, Sendable {
     var error: String?
 }
 
+/// Who a frame shows, for telling athletes apart by the number on their hip: the people Vision finds and, when one
+/// stands alone, the text on their hip band.
+nonisolated struct HipRead: Encodable, Sendable {
+    struct Text: Encodable, Sendable {
+        let text: String
+        let confidence: Double
+    }
+    let path: String
+    /// Whole bodies as x, y, width, height (fractions from the top-left) and confidence, the tallest (the main one) first.
+    var people: [[Double]] = []
+    /// The main person is at least 30% of the frame tall and no one else shows at half their height and a third of
+    /// their width or more.
+    var solo = false
+    /// Read on the main person's hip band, only when solo.
+    var text: [Text] = []
+    var error: String?
+}
+
 nonisolated enum Culling {
     static func preview(_ url: URL, longSide: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
@@ -227,6 +245,47 @@ nonisolated enum Culling {
             result.crushed = Double(crushed) / n * 100
         }
         return (result, fingerprint.results?.first)
+    }
+
+    /// The people in a frame's preview and, when one stands alone, the text on their hip band (see `HipRead`).
+    static func hips(_ url: URL, longSide: Int) -> HipRead {
+        var result = HipRead(path: url.path)
+        guard let image = preview(url, longSide: longSide) else {
+            result.error = "no preview"
+            return result
+        }
+        let people = VNDetectHumanRectanglesRequest()
+        people.upperBodyOnly = false
+        try? VNImageRequestHandler(cgImage: image, orientation: .up).perform([people])
+        let found = (people.results ?? []).filter { $0.confidence >= 0.3 }
+            .map { (box: box($0.boundingBox), confidence: Double($0.confidence)) }.sorted { $0.box.height > $1.box.height }
+        result.people = found.map { [$0.box.minX, $0.box.minY, $0.box.width, $0.box.height, $0.confidence] }
+        guard let main = found.first?.box else { return result }
+        result.solo = main.height >= 0.3 && !found.dropFirst().contains {
+            $0.box.height >= 0.5 * main.height && $0.box.width >= 0.33 * main.width
+        }
+        guard result.solo else { return result }
+        // The number sits on the hip: 30–80% of the way down the body, a little wider than it. Read at 3× (calibrated
+        // on ICN Nationals 2026: about half of solo frames read, 99% of reads right).
+        let width = Double(image.width), height = Double(image.height)
+        let x0 = max(main.minX - 0.05, 0) * width, x1 = min(main.maxX + 0.05, 1) * width
+        let y0 = min(max(main.minY + 0.3 * main.height, 0), 1) * height, y1 = min(main.minY + 0.8 * main.height, 1) * height
+        guard x1 - x0 >= 4, y1 - y0 >= 4,
+              let band = image.cropping(to: CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0).integral),
+              let context = CGContext(data: nil, width: band.width * 3, height: band.height * 3, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return result }
+        context.interpolationQuality = .high
+        context.draw(band, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
+        guard let enlarged = context.makeImage() else { return result }
+        let reading = VNRecognizeTextRequest()
+        reading.recognitionLevel = .accurate
+        reading.usesLanguageCorrection = false
+        reading.minimumTextHeight = 0.01
+        try? VNImageRequestHandler(cgImage: enlarged, orientation: .up).perform([reading])
+        result.text = (reading.results ?? []).compactMap { $0.topCandidates(1).first }
+            .map { HipRead.Text(text: $0.string, confidence: Double($0.confidence)) }
+        return result
     }
 }
 

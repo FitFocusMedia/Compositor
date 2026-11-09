@@ -42,6 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from . import (COMP_RENDER, CompError, Project, Stopped, _lab, analyze, check_comp_render, comp_render, develop,
                lightroom_crop, lightroom_settings)
+from . import athletes
 from .cull import (DEFAULT_RULE, _run_listed, assign, frames_from, gather, group, judge, load_results, moments_of,
                    scan, write_results)
 from .runlog import Progress
@@ -60,6 +61,8 @@ BUILT_IN = {
         "description": "physique and fitness stages: posing rounds and held mandatories, frames that a crop can rescue",
         "rate": 0.40, "gap": 2.0, "distance": 0.6, "max_moment": None, "rule": dict(DEFAULT_RULE),
         "auto_crop": False,
+        # With a run sheet, every athlete gets at least this many picks of them alone (see compkit/athletes.py).
+        "min_solo": 15,
     },
     # Not yet tested against a delivered fight night: a burst frame counts for a fraction of a held-pose frame, a run
     # of the same scene splits every 4 s so one round isn't one moment, and a better score counts a little across
@@ -210,9 +213,16 @@ def _now() -> str:
 
 # Cull and re-dial ---------------------------------------------------------------------------------------------------
 
-def cull_show(show: Show, *, rate: float | None = None, count: int | None = None, sheets: bool = True) -> dict:
+def cull_show(show: Show, *, rate: float | None = None, count: int | None = None, sheets: bool = True,
+              runsheet=None, min_solo: int | None = None) -> dict:
     """Culls the show's cards with its profile (resumable: scores are cached in cull/.cache). Run again (say, with a
-    card added), it keeps the keep rate or count the show was last dialed to unless given another."""
+    card added), it keeps the keep rate or count the show was last dialed to unless given another. With a run sheet
+    (kept with the show once given), athletes are told apart by their hip numbers and any with fewer than `min_solo`
+    picks of them alone get their best alternates (see compkit/athletes.py); `min_solo` too is kept, 0 turns it off."""
+    if runsheet:
+        athletes.runsheet(runsheet)  # a sheet that can't be read fails here, before it's kept
+        show.data["runsheet"] = str(Path(runsheet).expanduser().resolve())
+        show.save()
     p = show.profile
     progress = Progress("cull", folder=show.logs, unit="frames")
     last = show.data.get("cull") or {}
@@ -223,29 +233,39 @@ def cull_show(show: Show, *, rate: float | None = None, count: int | None = None
     else:
         dial = next(({key: last[key]} for key in ("count", "rate", "per_moment") if last.get(key) is not None),
                     {"per_moment": p["per_moment"]} if p.get("per_moment") else {"rate": p["rate"]})
+    min_solo = min_solo if min_solo is not None else last.get("min_solo", p.get("min_solo"))
     paths = gather(show.data["cards"])
     if not paths:
         raise CompError("no pictures on the show's cards yet")
     frames = frames_from(scan(paths, show.cull_folder / ".cache", progress=progress))
     group(frames, gap=p["gap"], distance=p["distance"], max_moment=p.get("max_moment"))
     judge(frames)
-    decide(show.cull_folder, frames, rule=p["rule"], dial=dial, again=count is not None or rate is not None)
+    sheet = athletes.runsheet(show.data["runsheet"]) if show.data.get("runsheet") else None
+    if sheet:
+        hips = athletes.read_hips(paths, show.cull_folder / ".cache", progress=Progress("athletes", folder=show.logs, unit="frames"))
+        athletes.identify(frames, hips, sheet)
+    decide(show.cull_folder, frames, rule=p["rule"], dial=dial, again=count is not None or rate is not None,
+           sheet=sheet, min_solo=min_solo)
     progress.finish()
     settings = {"profile": p["name"], "gap": p["gap"], "distance": p["distance"], "max_moment": p.get("max_moment"),
-                "rule": p["rule"], **dial}
+                "rule": p["rule"], **dial, "runsheet": show.data.get("runsheet"), "min_solo": min_solo}
     summary = write_results(frames, show.cull_folder, sheets=sheets, settings=settings)
     if not show.data.get("date") and frames and frames[0].get("captured"):
         show.data["date"] = frames[0]["captured"][:10]
-    show.data["cull"] = {**{k: summary[k] for k in ("frames", "moments", "picks", "rate", "rejects")}, "at": _now(), **dial}
+    show.data["cull"] = {**{k: summary[k] for k in ("frames", "moments", "picks", "rate", "rejects")}, "at": _now(), **dial,
+                         "min_solo": min_solo}
     show.save()
     return summary
 
 
-def decide(cull_folder, frames: list[dict], *, rule: dict, dial: dict, again: bool = False) -> None:
+def decide(cull_folder, frames: list[dict], *, rule: dict, dial: dict, again: bool = False, sheet: dict | None = None,
+           min_solo: int | None = None) -> None:
     """Sets every frame's status, keeping earlier decisions: frames picked or passed over by an earlier run keep
     their status (so a card that arrives later never changes what was already graded and delivered), and only new
     frames are picked, at the dial's rate. `again` (a new rate or count) decides every frame afresh. Statuses set by
-    hand (set_status, the dashboard) always win. Kept in cull/decisions.json."""
+    hand (set_status, the dashboard) always win. Then, with a run sheet (`sheet`, frames identified) and `min_solo`,
+    athletes short of solo picks get their best alternates (athletes.balance), kept like any automatic pick. Kept in
+    cull/decisions.json."""
     path = Path(cull_folder) / "decisions.json"
     decisions = _read_json(path, {"auto": {}, "manual": {}})
     earlier = {} if again else decisions["auto"]
@@ -262,6 +282,14 @@ def decide(cull_folder, frames: list[dict], *, rule: dict, dial: dict, again: bo
     decisions["auto"] = {f["path"]: f["status"] for f in frames}
     for frame in frames:
         frame["status"] = decisions["manual"].get(frame["path"], frame["status"])
+    promoted = set() if again else set(decisions.get("promoted", []))
+    if sheet and min_solo:
+        for frame in athletes.balance(frames, sheet, min_solo, fixed=decisions["manual"]):
+            decisions["auto"][frame["path"]] = "pick"
+            promoted.add(frame["path"])
+    decisions["promoted"] = sorted(promoted)
+    for frame in frames:
+        frame["promoted"] = frame["path"] in promoted
     Path(cull_folder).mkdir(parents=True, exist_ok=True)
     _write_json(path, decisions)
 
@@ -289,33 +317,42 @@ def set_status(cull_folder, changes: dict) -> dict:
 
 
 def redial(cull_folder, *, rate: float | None = None, count: int | None = None, per_moment: int | None = None,
-           rule: dict | None = None, sheets: bool = True) -> dict:
+           rule: dict | None = None, sheets: bool = True, min_solo: int | None = None) -> dict:
     """Picks again from a finished cull's scores ("show me 35%", "show me 1,000"): no frame is read again, and
-    picks.txt, cull.csv and the contact sheets are rewritten. Grouping and flags stay as the cull made them."""
+    picks.txt, cull.csv and the contact sheets are rewritten. Grouping and flags stay as the cull made them. With a
+    run sheet, athletes are balanced to `min_solo` (default: the cull's; 0 turns it off; see `decide`); given only
+    `min_solo`, every other pick stays as it is."""
     frames, settings = load_results(cull_folder)
     rule = {**DEFAULT_RULE, **settings.get("rule", {}), **(rule or {})}
+    again = True
     if per_moment is not None:
         dial = {"per_moment": per_moment}
     elif count is not None:
         dial = {"count": count}
     elif rate is not None:
         dial = {"rate": rate}
+    elif min_solo is not None:
+        dial, again = {k: settings[k] for k in ("per_moment", "count", "rate") if settings.get(k) is not None}, False
     else:
         raise CompError("say how many to pick: a rate (35%) or a count (1000)")
-    used = assign(frames, rule=rule, **dial)
-    decide(cull_folder, frames, rule=rule, dial=dial, again=True)
+    if min_solo and not settings.get("runsheet"):
+        raise CompError("balancing athletes needs the run sheet: `compkit show cull SHOW --runsheet FILE` first")
+    min_solo = settings.get("min_solo") if min_solo is None else min_solo
+    sheet = athletes.runsheet(settings["runsheet"]) if settings.get("runsheet") else None
+    used = assign(frames, rule=rule, **dial) if again else {}
+    decide(cull_folder, frames, rule=rule, dial=dial, again=again, sheet=sheet, min_solo=min_solo)
     for key in ("rate", "count", "per_moment", "keep"):
         settings.pop(key, None)
     settings.update(dial)
-    settings["rule"] = rule
+    settings["rule"], settings["min_solo"] = rule, min_solo
     summary = write_results(frames, cull_folder, sheets=sheets, settings=settings)
-    return {**summary, "dial": dial, "rule": used.get("rule")}
+    return {**summary, "dial": dial, "rule": used.get("rule"), "min_solo": min_solo}
 
 
 def pick_show(show: Show, **dial) -> dict:
     summary = redial(show.cull_folder, rule=show.profile["rule"], **dial)
     show.data["cull"] = {**show.data.get("cull", {}), **{k: summary[k] for k in ("frames", "moments", "picks", "rate", "rejects")},
-                         "at": _now(), **summary["dial"]}
+                         "at": _now(), **summary["dial"], "min_solo": summary["min_solo"]}
     for key in ("rate", "count", "per_moment"):
         if key not in summary["dial"]:
             show.data["cull"].pop(key, None)

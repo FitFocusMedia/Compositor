@@ -70,6 +70,9 @@ usage:
       also writes every frame's feature print ("<count> <length>\n" then float32 rows) for learning picks
   comp-render previews <file>... | --list <paths.txt> --out <folder> [--size 400]
       upright JPEG thumbnails from each file's embedded preview (RAWs aren't decoded), named <file>.jpg
+  comp-render hips <file>... | --list <paths.txt> [--size 1024]
+      who each frame shows, from its embedded preview: Vision's people (the tallest first), whether one stands alone,
+      and, when one does, the text read on their hip band, where competitors wear their number
   comp-render subject <picture>
       what Apple Vision finds in a picture, as JSON boxes in fractions of the picture from its top-left corner:
       faces, people (whole bodies), subject (the foreground Remove Background keeps, with its share of the
@@ -529,7 +532,7 @@ case "develop":
                         whiteBalance: mapping.whiteBalance, notes: mapping.notes, skipped: mapping.skipped,
                         localCorrections: preset.corrections.filter(\.active).count))
 
-case "probe", "score", "previews":
+case "probe", "score", "previews", "hips":
     var files: [String] = [], longSide = command == "previews" ? 400 : 1024, embeddings: String?, outFolder: String?
     while !arguments.isEmpty {
         let argument = arguments.removeFirst()
@@ -574,6 +577,10 @@ case "probe", "score", "previews":
     } else if command == "probe" {
         let results = Results<FrameInfo>(urls.count)
         DispatchQueue.concurrentPerform(iterations: urls.count) { results.set($0, FrameInfo(url: urls[$0])) }
+        printJSON(results.items.compactMap { $0 })
+    } else if command == "hips" {
+        let results = Results<HipRead>(urls.count)
+        DispatchQueue.concurrentPerform(iterations: urls.count) { results.set($0, Culling.hips(urls[$0], longSide: longSide)) }
         printJSON(results.items.compactMap { $0 })
     } else {
         let results = Results<(FrameScore, VNFeaturePrintObservation?)>(urls.count)

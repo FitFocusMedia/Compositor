@@ -50,6 +50,8 @@ and the points where you review and approve.
 compkit show new SHOW --card /path/to/card-copy --profile competition --name "Spring Classic"
 compkit show cull SHOW                       # picks by the profile's keep rate; contact sheets in SHOW/cull/sheets
 compkit show pick SHOW --rate 35%            # re-dial from the same scores, in seconds (or --count 1000)
+compkit show cull SHOW --runsheet sheet.csv  # competitions: athletes by hip number, SHOW/cull/athletes.csv
+compkit show pick SHOW --min-solo 15         # promote alternates until every athlete has 15 picks alone in frame
 compkit show setup SHOW                      # white balance / exposure candidates on one sheet …
 compkit show setup SHOW --approve B          # … approved for the show (or 1=B,2=C,… per lighting)
 compkit show grade SHOW                      # tunable projects + 2048 px JPEGs, with the approved settings

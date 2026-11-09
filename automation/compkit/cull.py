@@ -455,15 +455,18 @@ def write_results(frames: list[dict], out, *, sheets: bool = True, sheet_moments
                "rate": round(len(picks) / max(1, len(frames)), 3),
                "alternates": sum(f["status"] == "alternate" for f in frames),
                "rejects": sum(f["status"] == "reject" for f in frames), "out": str(out)}
+    if settings and settings.get("runsheet"):  # a show with a run sheet: who has how many photos of their own
+        from .athletes import runsheet, write_table  # (it builds on this module)
+        summary["athletes"] = write_table(frames, runsheet(settings["runsheet"]), out, settings.get("min_solo"))
     if sheets:
         summary["sheets"] = _contact_sheets(frames, out / "sheets", sheet_moments, thumb)
     return summary
 
 
-def _csv_text(rows: list[dict]) -> str:
+def _csv_text(rows: list[dict], columns: list[str] = COLUMNS) -> str:
     import io
     text = io.StringIO()
-    writer = csv.DictWriter(text, fieldnames=COLUMNS, extrasaction="ignore")
+    writer = csv.DictWriter(text, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
     return text.getvalue()
