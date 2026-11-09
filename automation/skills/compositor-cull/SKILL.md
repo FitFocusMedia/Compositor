@@ -58,7 +58,10 @@ have it open, LightCraft must run with `--control 7980` for the toolkit to reach
 **Automatic crops** (`framing.suggest`: crop in around people at the photo's shape, level a tilted horizon) are
 off by default (`auto_crop`, per profile). On the person's workshop they matched their own crops no better than
 the whole frame. Vision's horizon misreads stage and room lines indoors (78 of 170 frames "tilted", none really).
-Say so if they ask for automatic crops; manual crops in the dashboard are dependable.
+On a stage show, the rule crop worked: on ICN Nationals 2026 the person approved crops round the athlete (top margin
+0.17× athlete height, bottom 0.07×, 3:2) on a sample sheet, and levelling from the camera's tilt sensor (Canon
+RollAngle) instead of the horizon. Both are written into Lightroom Classic sidecars: see the compositor-lightroom
+skill. Otherwise manual crops in the dashboard are dependable.
 
 ## Rules
 
